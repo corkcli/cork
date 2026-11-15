@@ -1,0 +1,396 @@
+{
+  "name": "A base named by hash",
+  "description": "Hooks know what a symbol holds on disk, not the server's version. A base of {version: 0, hash: H} is resolved from the key's history by key hash or by the content_hash an op carried; a hash the server never saw is unknown_base, with the others' unpromoted ops; a key never written takes any hash as version 0.",
+  "steps": [
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "alice-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "bob-1",
+        "agent_id": "codex-b",
+        "person": "bob@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "bob-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 10,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "c0"
+        },
+        "kind": "modify_body",
+        "payload": "ZGlmZg==",
+        "hlc": {
+          "w": 10,
+          "c": 0
+        },
+        "content_hash": "c1"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "op_id": "alice-1.1",
+            "key": "code:src/cli.py::parse_config",
+            "version": 1,
+            "hash": "$bind:h1",
+            "seq": 1
+          }
+        }
+      ]
+    },
+    {
+      "at": 11,
+      "conn": "bob",
+      "send": {
+        "t": "check",
+        "req": "q1",
+        "keys": [
+          {
+            "key": "code:src/cli.py::parse_config",
+            "base": {
+              "version": 0,
+              "hash": "c1"
+            },
+            "kind": "modify_body"
+          }
+        ]
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "check_result",
+            "req": "q1",
+            "results": [
+              {
+                "key": "code:src/cli.py::parse_config",
+                "status": "ok",
+                "current": {
+                  "version": 1,
+                  "hash": "$ref:h1"
+                },
+                "would": "accept"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 12,
+      "conn": "bob",
+      "send": {
+        "t": "check",
+        "req": "q2",
+        "keys": [
+          {
+            "key": "code:src/cli.py::parse_config",
+            "base": {
+              "version": 0,
+              "hash": "$ref:h1"
+            },
+            "kind": "modify_body"
+          }
+        ]
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "check_result",
+            "req": "q2",
+            "results": [
+              {
+                "key": "code:src/cli.py::parse_config",
+                "status": "ok",
+                "current": {
+                  "version": 1
+                },
+                "would": "accept"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 13,
+      "conn": "bob",
+      "send": {
+        "t": "check",
+        "req": "q3",
+        "keys": [
+          {
+            "key": "code:src/cli.py::parse_config",
+            "base": {
+              "version": 0,
+              "hash": "edited-by-hand"
+            },
+            "kind": "modify_body"
+          }
+        ]
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "check_result",
+            "req": "q3",
+            "results": [
+              {
+                "key": "code:src/cli.py::parse_config",
+                "status": "unknown_base",
+                "current": {
+                  "version": 1
+                },
+                "theirs": [
+                  {
+                    "op_id": "alice-1.1",
+                    "version": 1,
+                    "author": {
+                      "session": "alice-1"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 20,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "c1"
+        },
+        "kind": "modify_body",
+        "payload": "ZGlmZg==",
+        "hlc": {
+          "w": 20,
+          "c": 0
+        },
+        "content_hash": "c2"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "ack",
+            "op_id": "bob-1.1",
+            "version": 2,
+            "hash": "$bind:h2",
+            "seq": 2
+          }
+        }
+      ]
+    },
+    {
+      "at": 21,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.2",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "c1"
+        },
+        "kind": "modify_body",
+        "payload": "ZGlmZg==",
+        "hlc": {
+          "w": 21,
+          "c": 0
+        },
+        "content_hash": "c3"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "reject",
+            "op_id": "alice-1.2",
+            "key": "code:src/cli.py::parse_config",
+            "reason": "conflict",
+            "current": {
+              "version": 2,
+              "hash": "$ref:h2"
+            },
+            "theirs": [
+              {
+                "op_id": "bob-1.1",
+                "version": 2
+              }
+            ],
+            "holder": {
+              "session": "bob-1"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "at": 22,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.3",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "edited-by-hand"
+        },
+        "kind": "modify_body",
+        "payload": "ZGlmZg==",
+        "hlc": {
+          "w": 22,
+          "c": 0
+        },
+        "content_hash": "c4"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "reject",
+            "op_id": "alice-1.3",
+            "key": "code:src/cli.py::parse_config",
+            "reason": "unknown_base",
+            "current": {
+              "version": 2
+            },
+            "theirs": [
+              {
+                "op_id": "bob-1.1",
+                "author": {
+                  "session": "bob-1"
+                }
+              }
+            ],
+            "holder": {
+              "session": "bob-1"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "at": 23,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.4",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "c2"
+        },
+        "kind": "modify_body",
+        "payload": "ZGlmZg==",
+        "hlc": {
+          "w": 23,
+          "c": 0
+        },
+        "content_hash": "c5"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "op_id": "alice-1.4",
+            "version": 3,
+            "seq": 3
+          }
+        }
+      ]
+    },
+    {
+      "at": 24,
+      "conn": "bob",
+      "send": {
+        "t": "check",
+        "req": "q4",
+        "keys": [
+          {
+            "key": "code:src/new.py::fresh",
+            "base": {
+              "version": 0,
+              "hash": "anything"
+            },
+            "kind": "modify_body"
+          }
+        ]
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "check_result",
+            "req": "q4",
+            "results": [
+              {
+                "key": "code:src/new.py::fresh",
+                "status": "ok",
+                "current": {
+                  "version": 0
+                },
+                "would": "accept"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

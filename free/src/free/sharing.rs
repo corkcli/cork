@@ -1,5 +1,5 @@
-//! The free version has no shared-login detection; the cloud's lives in Collide's private
-//! repo. These are its free answers, under the same names, so the engine
+//! The free version counts no machines per login; the cloud's count lives in Cork's
+//! private repo. These are its free answers, under the same names, so the engine
 //! builds and runs on one machine without it.
 
 use std::collections::BTreeSet;
@@ -13,7 +13,3 @@ pub fn logins(_store: &Store, _workspace: &str, _users: &BTreeSet<String>, _now:
 }
 
 pub fn note(_store: &Store, _workspace: &str, _user: &str, _machine: &str, _now: f64) {}
-
-pub fn notice(_store: &Store, _scope: &str, _workspace: &str, _user: &str, _session: &str, _billing_url: &str, _now: f64) -> Option<String> {
-    None
-}

@@ -1,13 +1,13 @@
 {
-  "name": "collide",
-  "version": "0.2.0",
+  "name": "cork",
+  "version": "0.4.2",
   "description": "Several coding agents on one repo, without the collisions: each agent is briefed on the code its prompt is about, told the moment another agent or teammate changes what it depends on, and has its pushes rebased, tested and landed in one step.",
   "author": {
     "name": "Lithometric",
-    "url": "https://collidemcp.com"
+    "url": "https://corkcli.com"
   },
-  "homepage": "https://collidemcp.com",
-  "repository": "https://github.com/lithometric/collidemcp/tree/main/plugin",
+  "homepage": "https://corkcli.com",
+  "repository": "https://github.com/lithometric/cork/tree/main/plugin",
   "license": "MIT",
   "keywords": [
     "multi-agent",
@@ -20,21 +20,24 @@
     "merge-conflicts"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "hooks": {},
   "interface": {
-    "displayName": "Collide",
+    "displayName": "Cork",
     "shortDescription": "Multiplayer for coding agents",
-    "longDescription": "Collide keeps coding agents that work on the same repository, on one machine or across a team, from overwriting each other. Each agent is briefed on the code its task is about, hears when another agent changes code it depends on, and is held from writing over work in progress. Collide's MCP server adds tools to look up any symbol, see what depends on it, and leave notes on code for the next agent.",
+    "longDescription": "Cork keeps coding agents that work on the same repository, on one machine or across a team, from overwriting each other. Each agent is briefed on the code its task is about, hears when another agent changes code it depends on, and is held from writing over work in progress. Cork's MCP server adds tools to look up any symbol, see what depends on it, and leave notes on code for the next agent.",
     "developerName": "Lithometric",
     "category": "Developer Tools",
     "capabilities": [
       "Read",
       "Write"
     ],
-    "websiteURL": "https://collidemcp.com",
-    "privacyPolicyURL": "https://collidemcp.com/privacy",
-    "termsOfServiceURL": "https://collidemcp.com/terms",
-    "supportURL": "https://collidemcp.com/support",
-    "brandColor": "#34d399",
+    "websiteURL": "https://corkcli.com",
+    "privacyPolicyURL": "https://corkcli.com/privacy",
+    "termsOfServiceURL": "https://corkcli.com/terms",
+    "supportURL": "https://corkcli.com/support",
+    "brandColor": "#946800",
+    "brandColorDark": "#FFC61A",
     "composerIcon": "./assets/icon.png",
     "logo": "./assets/icon.png",
     "defaultPrompt": [

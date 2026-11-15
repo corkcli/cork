@@ -2,14 +2,14 @@
 //!
 //! The previous source was discarded the moment it was parsed, so "what
 //! changed" is answered by diffing the hashes of the old lines against the
-//! new ones. Snippets come from the NEW content only and live in TTL'd
-//! ephemeral events; the durable ledger keeps ranges alone.
+//! new ones. A hunk is a range and nothing else: no line of code is
+//! quoted, in the ledger, the live events or the draft markers.
 //!
 //! The matcher is a faithful port of CPython's `difflib.SequenceMatcher` with
 //! `autojunk=False` and no junk predicate. That is not a stylistic choice:
 //! hunks land in the ledger and on the dashboard's change pages, so a
-//! different-but-reasonable diff algorithm would make the two servers
-//! disagree about what an edit did.
+//! different-but-reasonable diff algorithm would describe the same edit
+//! differently from the history already written.
 
 use std::collections::HashMap;
 
@@ -17,8 +17,6 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
 pub const MAX_HUNKS: usize = 8;
-pub const MAX_HUNK_SNIPPET: usize = 4;
-pub const MAX_SNIPPET_LINE: usize = 160;
 
 pub fn line_hashes(lines: &[&str]) -> Vec<String> {
     lines
@@ -158,13 +156,9 @@ pub fn opcodes(a: &[String], b: &[String]) -> Vec<Opcode> {
     out
 }
 
-fn clip(text: &str, limit: usize) -> String {
-    text.chars().take(limit).collect()
-}
-
 /// Change ranges between the previous and current report of a file. First
 /// sight yields nothing — there is nothing to compare against.
-pub fn hunks(old_hashes: &[String], new_hashes: &[String], new_lines: &[&str]) -> Vec<Value> {
+pub fn hunks(old_hashes: &[String], new_hashes: &[String]) -> Vec<Value> {
     if old_hashes.is_empty() {
         return Vec::new();
     }
@@ -173,23 +167,18 @@ pub fn hunks(old_hashes: &[String], new_hashes: &[String], new_lines: &[&str]) -
         if code.tag == "equal" {
             continue;
         }
-        // no source on this server (a local parse): the range, no quote
-        let lines: Vec<String> = new_lines
-            .get(code.j1..code.j2)
-            .unwrap_or(&[])
-            .iter()
-            .take(MAX_HUNK_SNIPPET)
-            .map(|line| clip(line.trim_end(), MAX_SNIPPET_LINE))
-            .collect();
+        // ranges only, never a quoted line: this server keeps no source,
+        // whichever client sent the file (an older hook or MCP report_edit
+        // sends it whole; it is parsed and dropped). `lines` stays, empty,
+        // for the readers that expect the key.
         out.push(json!({
             "op": code.tag,
             "old_start": code.i1 + 1, "old_end": code.i2,
             "new_start": code.j1 + 1, "new_end": code.j2,
-            "lines": lines,
+            "lines": [],
         }));
-        // the marker goes on at exactly MAX_HUNKS, not only past it — the
-        // Python original appends and then breaks, so a file with exactly
-        // eight hunks still says it was cut
+        // the marker goes on at exactly MAX_HUNKS, not only past it, so a
+        // file with exactly eight hunks still says it was cut
         if out.len() >= MAX_HUNKS {
             out.push(json!({"op": "truncated"}));
             break;
@@ -214,4 +203,24 @@ pub fn hunk_totals(hunks: &[Value]) -> (i64, i64) {
         }
     }
     (added, removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whatever client sent the file (an older hook or MCP report_edit sends
+    /// its text), a hunk is a range: no line of code is ever quoted.
+    #[test]
+    fn a_hunk_is_a_range_and_quotes_no_code() {
+        let old = line_hashes(&["def f(x):", "    return x"]);
+        let new = line_hashes(&["def f(x, y):", "    return x + y", "SECRET = 1"]);
+        let out = hunks(&old, &new);
+        assert!(!out.is_empty());
+        for hunk in &out {
+            assert_eq!(hunk["lines"], json!([]), "{hunk}");
+            assert!(hunk.get("new_start").is_some() && hunk.get("new_end").is_some());
+        }
+        assert!(!Value::Array(out).to_string().contains("SECRET"));
+    }
 }

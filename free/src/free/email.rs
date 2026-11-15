@@ -1,1 +1,1 @@
-//! The free version has no email: the cloud's lives in Collide's private repo.
+//! The free version has no email: the cloud's lives in Cork's private repo.

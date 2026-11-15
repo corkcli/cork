@@ -1,6 +1,6 @@
 //! Recipes: a verified transformation, kept so the next agent replays it.
 //!
-//! When `collide-hook apply` lands a batch of typed ops and the repo's check
+//! When `cork apply` lands a batch of typed ops and the repo's check
 //! passes, the hook may save the batch as a recipe: the ops with the
 //! primary symbol abstracted to `$target` and its direct callers to
 //! `$caller`. A later agent whose prompt names the same symbol sees the
@@ -53,7 +53,7 @@ pub fn save(store: &Store, scope: &str, user: &str, session: &str, body: &Value,
     });
     let _ = store.kv_put(BUCKET, &format!("{scope}:{id}"), &record, now);
     let _ = store.ledger_append(scope, "recipe_saved", &json!({"user": user, "session": session, "recipe": id, "name": record["name"], "target_symbol": target_symbol}), now);
-    json!({"ok": true, "id": id, "replay": format!("collide-hook apply --recipe {id} --at <path>::{target_symbol}")})
+    json!({"ok": true, "id": id, "replay": format!("cork apply --recipe {id} --at <path>::{target_symbol}")})
 }
 
 /// The scopes a federated recipe read may touch: the caller's own first —
@@ -165,7 +165,7 @@ pub fn brief_lines(recipes: &[Value], now: f64) -> Vec<String> {
             _ => String::new(),
         };
         out.push(format!(
-            "  {id} \"{name}\" — applied at {applied_at}{from}, {files} file(s), check passed, by {by} {}, replayed {uses}x: `collide-hook apply --recipe {id} --at <path>::{target}` (it computes the batch for YOUR target and its callers, writes, verifies, restores on failure, reports)",
+            "  {id} \"{name}\" — applied at {applied_at}{from}, {files} file(s), check passed, by {by} {}, replayed {uses}x: `cork apply --recipe {id} --at <path>::{target}` (it computes the batch for YOUR target and its callers, writes, verifies, restores on failure, reports)",
             age_text(age)
         ));
     }

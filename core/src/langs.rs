@@ -1,6 +1,5 @@
 //! One table entry per language. Adding a language is a `LangSpec`, never a
-//! new engine — the same rule the Python side follows, so the two stay in
-//! lockstep and the differential test can prove it.
+//! new engine.
 
 use tree_sitter::Language;
 

@@ -9,7 +9,8 @@
 //! delivered inside the next hook event of any kind. Classified, never raw:
 //! newly failing (yours, or another agent's recent write), already failing
 //! before you started, alternating, same as before, pending a file you have
-//! not written yet.
+//! not written yet, or flaky in this repo (flaky.rs: a quick failing check
+//! runs once more on the same tree, and what flips is shared with the team).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -23,6 +24,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::{self, Env};
+use crate::flaky;
 use crate::http;
 use crate::report::{save_json, text, user_agent, MAP_EXTS, WRITE_TOOLS};
 
@@ -77,15 +79,47 @@ fn fetch_deltas(hook_input: &Value, env: &Env) -> String {
     if !cfg.usable() {
         return String::new();
     }
+    // each agent of the session (its lead, each helper) reads the deltas on
+    // its own: how far it has read, and what it was told. Shared, one
+    // helper's read moved the session past a change the others never heard
+    let worker = text(hook_input, "agent_id");
+    let since_key = if worker.is_empty() { "deltas_ts".to_string() } else { format!("deltas_ts:{worker}") };
     let state_file = state_path(&session, env);
-    let since = load_state(&state_file).get("deltas_ts").and_then(Value::as_f64).unwrap_or(0.0);
-    let payload = json!({"repo_id": cfg.repo_id, "session": session, "since_ts": since, "budget": DELTAS_BUDGET});
+    let since = load_state(&state_file).get(&since_key).and_then(Value::as_f64).unwrap_or(0.0);
+    // a teammate's interface change is said once per agent: what the
+    // pre-write gate or the protocol's push already said stays out, and
+    // what the deltas say joins the set
+    let mut told = crate::deps::Told::load(env, &crate::proto::agent_of(&session, &worker));
+    let mut ids = told.ids();
+    // a helper: what the session's daemon pushed to the session is said
+    // already, whichever of its agents read it
+    if !worker.is_empty() {
+        let pushed = crate::deps::Told::load(env, &session).pushed_ids();
+        ids.extend(pushed.into_iter().filter(|f| !told.knows(f)));
+    }
+    let told_ids: Vec<&String> = ids.iter().rev().filter(|f| !f.starts_with("lint:")).take(200).collect();
+    let mut payload = json!({"repo_id": cfg.repo_id, "session": session, "since_ts": since, "budget": DELTAS_BUDGET, "told": told_ids});
+    // a session that lands its pushes hears "landing will rebase", never "pull now"
+    if crate::land::lands(&root, env) {
+        payload["lands"] = json!(true);
+    }
+    // a helper's call: the lines are that helper's, on the heads-up log too
+    if !worker.is_empty() {
+        payload["worker"] = json!(worker);
+    }
     let Ok(answer) = http::post(&cfg.server, "/deltas", &cfg.token, &user_agent(), &payload, DELTAS_TIMEOUT) else {
         return String::new();
     };
+    let facts: Vec<&str> = answer.get("facts").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    if !facts.is_empty() {
+        for fact in facts {
+            told.note(fact, "", false);
+        }
+        told.save();
+    }
     if let Some(ts) = answer.get("ts").and_then(Value::as_f64) {
         let mut state = load_state(&state_file);
-        state.insert("deltas_ts".into(), json!(ts));
+        state.insert(since_key, json!(ts));
         save_json(&state_file, &Value::Object(state));
     }
     let lines: Vec<&str> = answer
@@ -93,7 +127,16 @@ fn fetch_deltas(hook_input: &Value, env: &Env) -> String {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    lines.join("\n")
+    let mut said = lines.join("\n");
+    // the lines of the caller's own files each rename or new signature makes
+    // wrong, read here from disk (fixlines.rs)
+    if let Some(fixes) = answer.get("fixes").and_then(Value::as_array).filter(|f| !f.is_empty()) {
+        let fix = crate::fixlines::for_deltas(&root, fixes);
+        if !fix.is_empty() && !said.is_empty() {
+            said = format!("{said}\n{fix}");
+        }
+    }
+    said
 }
 
 /// Called first on every event: stash the pending verdict and the deltas so
@@ -118,19 +161,19 @@ pub fn deliver_pending(hook_input: &Value, env: &Env) {
 }
 
 pub fn verify_command(root: &Path) -> String {
-    let cfg = config::load_json(&root.join(".collide").join("config.json"));
+    let cfg = config::repo_config(&root);
     cfg.get("verify").and_then(Value::as_str).unwrap_or("").trim().to_string()
 }
 
 pub(crate) fn home(env: &Env) -> String {
-    let collide_home = config::get(env, "COLLIDE_HOME");
+    let cork_home = config::get(env, "CORK_HOME");
     let home = config::get(env, "HOME");
     // Windows sets USERPROFILE, not HOME, unless the hook runs under Git
     // Bash; a harness that runs it directly (Codex, Cursor) must still find
     // the credential. Python's expanduser reads it the same way.
     let profile = config::get(env, "USERPROFILE");
-    if !collide_home.is_empty() {
-        collide_home.to_string()
+    if !cork_home.is_empty() {
+        cork_home.to_string()
     } else if !home.is_empty() {
         home.to_string()
     } else if !profile.is_empty() {
@@ -154,7 +197,7 @@ pub fn resume_line(root: &Path, session: &str, env: &Env) -> String {
     let command = verify_command(root);
     let where_ = if command.is_empty() { String::new() } else { format!(" (`{command}`)") };
     if last.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        return format!("Collide: resuming this session — last check passed{where_}.");
+        return format!("Cork: resuming this session — last check passed{where_}.");
     }
     let failing: Vec<String> = last
         .get("failing")
@@ -166,12 +209,15 @@ pub fn resume_line(root: &Path, session: &str, env: &Env) -> String {
         names.push_str(&format!(" +{} more", failing.len() - 5));
     }
     let named = if names.is_empty() { String::new() } else { format!(": {names}") };
-    format!("Collide: resuming this session — last check FAILED{named}{where_}; fix or re-run it before new work.")
+    if last.get("flaky_only").and_then(Value::as_bool).unwrap_or(false) {
+        return format!("Cork: resuming this session — last check failed only on tests flaky in this repo{named}{where_}: not this session's change.");
+    }
+    format!("Cork: resuming this session — last check FAILED{named}{where_}; fix or re-run it before new work.")
 }
 
 pub fn state_path(session: &str, env: &Env) -> PathBuf {
     let tag: String = if session.is_empty() { "nosession".to_string() } else { session.chars().take(8).collect() };
-    PathBuf::from(home(env)).join(".collide").join("check").join(format!("{tag}.json"))
+    config::data_dir(env).join("check").join(format!("{tag}.json"))
 }
 
 fn load_state(path: &Path) -> Map<String, Value> {
@@ -306,6 +352,27 @@ fn failing_id_res() -> Vec<Regex> {
     ])
 }
 
+/// The failing tests a run names, in order; the catch-all `check` when it
+/// failed without naming any.
+fn failing_ids(output: &str, ok: bool) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if ok {
+        return ids;
+    }
+    for rx in failing_id_res() {
+        for m in rx.captures_iter(output) {
+            let v = m.get(1).map(|g| g.as_str().trim().to_string()).unwrap_or_default();
+            if !v.is_empty() && !ids.contains(&v) {
+                ids.push(v);
+            }
+        }
+    }
+    if ids.is_empty() {
+        ids.push("check".to_string());
+    }
+    ids
+}
+
 fn file_ref_res() -> Vec<Regex> {
     regexes(&[
         r"((?:[\w.-]+/)*[\w.-]+\.(?:py|pyi|ts|tsx|js|jsx|mjs|cjs|go|rs|java|cs|rb|c|h|cc|cpp|hpp|php)):(\d+)",
@@ -431,26 +498,16 @@ fn take_chars(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit { text.to_string() } else { text.chars().take(limit).collect() }
 }
 
-/// The verdict text. Mutates state (last, history, flags).
+/// The verdict text, and whether the run failed ONLY on tests known to be
+/// flaky in this repo (`known`: the team's registry and this machine's own
+/// evidence). Mutates state (last, history, flags).
+#[allow(clippy::too_many_arguments)]
 fn classify(
     root: &Path, command: &str, ok: bool, output: &str, elapsed: f64, written: &[String],
-    state: &mut Map<String, Value>, attribution: &Value,
-) -> String {
+    state: &mut Map<String, Value>, attribution: &Value, known: &BTreeMap<String, flaky::Evidence>,
+) -> (String, bool) {
     let tail = tail_chars(output, CHECK_TAIL_CHARS);
-    let mut ids: Vec<String> = Vec::new();
-    if !ok {
-        for rx in failing_id_res() {
-            for m in rx.captures_iter(output) {
-                let v = m.get(1).map(|g| g.as_str().trim().to_string()).unwrap_or_default();
-                if !v.is_empty() && !ids.contains(&v) {
-                    ids.push(v);
-                }
-            }
-        }
-        if ids.is_empty() {
-            ids.push("check".to_string());
-        }
-    }
+    let ids = failing_ids(output, ok);
     let norm = collapse(&tail);
     let sig = {
         let mut h = Sha256::new();
@@ -462,7 +519,12 @@ fn classify(
     let prev = state.get("last").cloned().filter(|l| l.is_object()).or_else(|| baseline.clone());
     let prev_failing = str_list(prev.as_ref().and_then(|p| p.get("failing")));
     let base_failing: BTreeSet<String> = str_list(baseline.as_ref().and_then(|b| b.get("failing"))).into_iter().collect();
-    let flaky: BTreeSet<String> = str_list(state.get("flaky")).into_iter().collect();
+    let mut flaky: BTreeSet<String> = str_list(state.get("flaky")).into_iter().collect();
+    flaky.extend(known.keys().cloned());
+    // the real failures first; a flaky test failing is not the writer's
+    let flaky_failing: Vec<String> = ids.iter().filter(|i| flaky.contains(*i)).cloned().collect();
+    let real_failing: Vec<String> = ids.iter().filter(|i| !flaky.contains(*i)).cloned().collect();
+    let flaky_only = !ok && real_failing.is_empty() && !flaky_failing.is_empty();
     let mut history: BTreeMap<String, Vec<bool>> = state
         .get("history")
         .and_then(Value::as_object)
@@ -485,15 +547,15 @@ fn classify(
     state.insert("history".into(), json!(history));
 
     let newly: Vec<String> = ids.iter().filter(|i| !prev_failing.contains(i) && !base_failing.contains(*i) && !flaky.contains(*i)).cloned().collect();
-    let preexisting: Vec<String> = ids.iter().filter(|i| base_failing.contains(*i)).cloned().collect();
-    let fixed: Vec<String> = prev_failing.iter().filter(|i| !ids.contains(i)).cloned().collect();
+    let preexisting: Vec<String> = ids.iter().filter(|i| base_failing.contains(*i) && !flaky.contains(*i)).cloned().collect();
+    let fixed: Vec<String> = prev_failing.iter().filter(|i| !ids.contains(i) && !flaky.contains(*i)).cloned().collect();
     let same = !ok && state.get("last").and_then(|l| l.get("sig")).and_then(Value::as_str) == Some(sig.as_str());
     let said: BTreeSet<String> = str_list(state.get("oscillation_said")).into_iter().collect();
     let mut flips: Vec<String> = Vec::new();
     for i in &ids {
         let h = history.get(i).cloned().unwrap_or_default();
         let changes = h.windows(2).filter(|w| w[0] != w[1]).count();
-        if changes >= 2 && !said.contains(i) {
+        if changes >= 2 && !said.contains(i) && !flaky.contains(i) {
             flips.push(i.clone());
         }
     }
@@ -507,10 +569,22 @@ fn classify(
         }
     }
     let where_ = if written.is_empty() { "your writes".to_string() } else { written.join(", ") };
-    let head = format!("Collide check (`{command}`, {elapsed:.1}s) after your write to {where_}: ");
+    let head = format!("Cork check (`{command}`, {elapsed:.1}s) after your write to {where_}: ");
     let mut lines: Vec<String> = Vec::new();
     if ok {
         lines.push(format!("{head}PASSED — marked verified."));
+        if !fixed.is_empty() {
+            lines.push(format!("  now passing: {}", fixed.join(", ")));
+        }
+    } else if flaky_only {
+        // said plainly, so the agent does not spend turns chasing it
+        lines.push(format!("{head}FAILED"));
+        let verb = if flaky_failing.len() == 1 { "failed, which is" } else { "failed, which are" };
+        lines.push(format!(
+            "  only {} {verb} flaky in this repo ({}): not your change",
+            flaky::backticked(&flaky_failing),
+            flaky::evidence_text(&flaky_failing, known)
+        ));
         if !fixed.is_empty() {
             lines.push(format!("  now passing: {}", fixed.join(", ")));
         }
@@ -525,6 +599,8 @@ fn classify(
         let key: Vec<String> = tail
             .lines()
             .filter(|ln| key_re.is_match(ln))
+            // a flaky test's own lines are not the failure to read
+            .filter(|ln| !flaky_failing.iter().any(|f| ln.contains(f.as_str())))
             .map(|ln| take_chars(ln.trim(), 160))
             .collect();
         if !same {
@@ -544,11 +620,14 @@ fn classify(
                 }
                 let age = who.get("age_s").and_then(Value::as_f64).unwrap_or(1e9);
                 if age <= CHECK_RECENT_S {
-                    let agent = who.get("agent").and_then(Value::as_str).filter(|a| !a.is_empty()).unwrap_or("an agent");
-                    let user = who.get("user").and_then(Value::as_str).filter(|u| !u.is_empty()).unwrap_or("a teammate");
+                    let agent = crate::prompt::agent_suffix(who.get("agent").and_then(Value::as_str).unwrap_or(""));
+                    // named as the reader knows them: `nickname (email)`, from the server
+                    let user = who.get("who").and_then(Value::as_str).filter(|u| !u.is_empty())
+                        .or_else(|| who.get("user").and_then(Value::as_str).filter(|u| !u.is_empty()))
+                        .unwrap_or("a teammate");
                     let whom = if who.get("same_user").and_then(Value::as_bool).unwrap_or(false) { "another session of yours" } else { user };
                     lines.push(format!(
-                        "  introduced by {whom} ({agent}) writing {path} {}, not by you — leave it to them; re-check after their next write",
+                        "  introduced by {whom}{agent} writing {path} {}, not by you — leave it to them; re-check after their next write",
                         age_text(who.get("age_s").and_then(Value::as_f64).unwrap_or(0.0))
                     ));
                 }
@@ -557,6 +636,12 @@ fn classify(
         if let Some(facts) = attribution.get("facts").and_then(Value::as_object) {
             for (name, fact) in facts {
                 let Some(fact) = fact.as_object() else { continue };
+                // the map could not tell which one: both named, neither as the fact
+                if let Some(paths) = fact.get("ambiguous").and_then(Value::as_array) {
+                    let paths: Vec<&str> = paths.iter().filter_map(Value::as_str).collect();
+                    lines.push(format!("  fact: `{name}` is defined in more than one file ({})", paths.join(", ")));
+                    continue;
+                }
                 let signature = fact.get("signature").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(name);
                 let doc = fact.get("doc").and_then(Value::as_str).unwrap_or("");
                 let path = fact.get("path").and_then(Value::as_str).unwrap_or("");
@@ -577,13 +662,24 @@ fn classify(
             lines.push(format!("  already failing before you started (not yours): {}", preexisting.join(", ")));
             state.insert("reported_preexisting".into(), json!(true));
         }
+        if !flaky_failing.is_empty() {
+            lines.push(format!(
+                "  also failed, flaky in this repo (not your change): {} ({})",
+                flaky::backticked(&flaky_failing),
+                flaky::evidence_text(&flaky_failing, known)
+            ));
+        }
         if !fixed.is_empty() {
             lines.push(format!("  now passing: {}", fixed.join(", ")));
         }
     }
-    state.insert("last".into(), json!({"ok": ok, "failing": ids, "sig": sig}));
+    let mut last = json!({"ok": ok, "failing": ids, "sig": sig});
+    if flaky_only {
+        last["flaky_only"] = json!(true);
+    }
+    state.insert("last".into(), last);
     state.insert("last_elapsed".into(), json!((elapsed * 1000.0).round() / 1000.0));
-    lines.join("\n")
+    (lines.join("\n"), flaky_only)
 }
 
 /// `check <root> <session> <run_id> <paths-json>`: the detached run.
@@ -602,28 +698,31 @@ pub fn check_command(root: &str, session: &str, run_id: &str, paths_json: &str, 
         .map(|v| str_list(Some(&v)))
         .unwrap_or_default();
     let state_file = state_path(session, env);
+    let fp_before = flaky::fingerprint(&root);
     let (ok, output, elapsed, timed_out) = run_verify(&root, &command, CHECK_MAX_S);
-    let mut state = load_state(&state_file);
+    let state = load_state(&state_file);
     let current = state.get("run_id").and_then(Value::as_str).unwrap_or("");
     if run_id != "baseline" && !current.is_empty() && current != run_id {
         return 0; // a later batch's check will speak instead
     }
+    let cfg = config::config(Some(&root), env);
+    let known = if timed_out {
+        BTreeMap::new()
+    } else {
+        learn_flaky(&root, &command, run_id, ok, &output, elapsed, fp_before.as_deref(), &state, &cfg, env)
+    };
+    // the rerun took time: a newer batch may have started meanwhile
+    let mut state = load_state(&state_file);
+    let current = state.get("run_id").and_then(Value::as_str).unwrap_or("");
+    if run_id != "baseline" && !current.is_empty() && current != run_id {
+        return 0;
+    }
     if run_id == "baseline" {
+        let mut ok = ok;
         if !timed_out {
-            let mut ids: Vec<String> = Vec::new();
-            if !ok {
-                for rx in failing_id_res() {
-                    for m in rx.captures_iter(&output) {
-                        let v = m.get(1).map(|g| g.as_str().trim().to_string()).unwrap_or_default();
-                        if !v.is_empty() && !ids.contains(&v) {
-                            ids.push(v);
-                        }
-                    }
-                }
-                if ids.is_empty() {
-                    ids.push("check".to_string());
-                }
-            }
+            // a flaky test failing at session start is not "already failing"
+            let ids: Vec<String> = failing_ids(&output, ok).into_iter().filter(|i| !known.contains_key(i)).collect();
+            ok = ok || ids.is_empty();
             state.insert("baseline".into(), json!({"ok": ok, "failing": ids}));
             state.insert("last_elapsed".into(), json!((elapsed * 1000.0).round() / 1000.0));
         }
@@ -631,7 +730,6 @@ pub fn check_command(root: &str, session: &str, run_id: &str, paths_json: &str, 
         if ok && !timed_out {
             // a passing baseline verifies the whole indexed tree: the first
             // agent's briefing then says "verified by …" like the fourth's
-            let cfg = config::config(Some(&root), env);
             if cfg.usable() {
                 let paths = crate::report::tracked_sources(&root);
                 let _ = http::post(&cfg.server, "/verified", &cfg.token, &user_agent(),
@@ -644,13 +742,12 @@ pub fn check_command(root: &str, session: &str, run_id: &str, paths_json: &str, 
     if timed_out {
         if !state.get("over_budget_said").and_then(Value::as_bool).unwrap_or(false) {
             state.insert("result".into(), json!({"run_id": run_id, "delivered": false,
-                "text": format!("Collide check (`{command}`) ran over {}s after your write; not run again this session — run it yourself.", CHECK_MAX_S as i64)}));
+                "text": format!("Cork check (`{command}`) ran over {}s after your write; not run again this session — run it yourself.", CHECK_MAX_S as i64)}));
             state.insert("over_budget_said".into(), json!(true));
         }
         save_json(&state_file, &Value::Object(state));
         return 0;
     }
-    let cfg = config::config(Some(&root), env);
     let mut attribution = json!({});
     if !ok {
         let mut files: Vec<String> = Vec::new();
@@ -686,14 +783,74 @@ pub fn check_command(root: &str, session: &str, run_id: &str, paths_json: &str, 
             }
         }
     }
-    let verdict = classify(&root, &command, ok, &output, elapsed, &written, &mut state, &attribution);
+    let (verdict, flaky_only) = classify(&root, &command, ok, &output, elapsed, &written, &mut state, &attribution, &known);
+    // the tree this run saw: the next run on the same tree is a rerun
+    if let (Some(fp), Some(last)) = (fp_before.as_ref(), state.get_mut("last").and_then(Value::as_object_mut)) {
+        last.insert("fp".into(), json!(fp));
+    }
     state.insert("result".into(), json!({"run_id": run_id, "delivered": false, "text": verdict}));
     save_json(&state_file, &Value::Object(state));
     if cfg.usable() && !written.is_empty() {
+        // a failure only on the repo's flaky tests does not mark the writes failed
         let _ = http::post(&cfg.server, "/verified", &cfg.token, &user_agent(),
-            &json!({"repo_id": cfg.repo_id, "paths": written, "command": command, "ok": ok}), Duration::from_secs(5));
+            &json!({"repo_id": cfg.repo_id, "paths": written, "command": command, "ok": ok || flaky_only}), Duration::from_secs(5));
     }
     0
+}
+
+/// What this run says about flaky tests, and every test known to be flaky
+/// in this repo afterwards (the team's registry and this machine's own).
+///
+/// Evidence comes only from runs on unchanged code: a failing check that
+/// names a failure nothing explains yet (not already failing, not known
+/// flaky, not a module still to be written) and is quick is run once more
+/// on the same tree; a test that fails and then passes is flaky. Two checks
+/// in a row on the same tree count the same way. What is learned goes to
+/// the server as names and counts (flaky.rs).
+#[allow(clippy::too_many_arguments)]
+fn learn_flaky(
+    root: &Path, command: &str, run_id: &str, ok: bool, output: &str, elapsed: f64, fp_before: Option<&str>,
+    state: &Map<String, Value>, cfg: &config::Config, env: &Env,
+) -> BTreeMap<String, flaky::Evidence> {
+    let ids = failing_ids(output, ok);
+    let last = state.get("last").filter(|l| l.is_object());
+    let last_fp = if run_id == "baseline" { None } else { last.and_then(|l| l.get("fp")).and_then(Value::as_str) };
+    let same_tree_as_last = fp_before.is_some() && last_fp == fp_before;
+    if ok && !same_tree_as_last {
+        flaky::flush(env, cfg);
+        return BTreeMap::new(); // a pass needs no names; counts still owed go now
+    }
+    let mut known = flaky::known(env, cfg);
+    let known_set: BTreeSet<String> = known.keys().cloned().collect();
+    let base_failing: BTreeSet<String> = if run_id == "baseline" {
+        BTreeSet::new()
+    } else {
+        str_list(state.get("baseline").and_then(|b| b.get("failing"))).into_iter().collect()
+    };
+    let unexplained = ids.iter().any(|i| flaky::clean_id(i) == *i && !known.contains_key(i) && !base_failing.contains(i));
+    let pending_module = missing_module_res().iter().any(|rx| {
+        rx.captures_iter(output).any(|m| m.get(1).map(|g| !module_on_disk(root, g.as_str())).unwrap_or(false))
+    });
+    let rerun_allowed = config::repo_config(&root)
+        .get("flaky_rerun")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut seen = BTreeMap::new();
+    if !ok && unexplained && !pending_module && rerun_allowed && elapsed <= flaky::RERUN_MAX_S && fp_before.is_some() {
+        let (ok2, output2, _, timed_out2) = run_verify(root, command, CHECK_MAX_S);
+        if !timed_out2 && flaky::fingerprint(root).as_deref() == fp_before {
+            seen = flaky::observe(&ids, &failing_ids(&output2, ok2), &known_set);
+        }
+    } else if same_tree_as_last {
+        let before = str_list(last.and_then(|l| l.get("failing")));
+        seen = flaky::observe(&before, &ids, &known_set);
+    }
+    flaky::record(env, cfg, &seen);
+    flaky::flush(env, cfg);
+    if !seen.is_empty() {
+        known = flaky::known(env, cfg);
+    }
+    known
 }
 
 /// SessionStart: what already fails before the first write, detached.
@@ -707,4 +864,50 @@ pub fn spawn_baseline(root: &Path, hook_input: &Value, env: &Env) {
     state.insert("root".into(), json!(config::absolute(root).to_string_lossy()));
     save_json(&state_file, &Value::Object(state));
     spawn_check(root, &session, "baseline", &[], env);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known(list: &[(&str, f64, f64)]) -> BTreeMap<String, flaky::Evidence> {
+        list.iter().map(|(id, runs, fails)| (id.to_string(), flaky::Evidence { runs: *runs, fails: *fails })).collect()
+    }
+
+    #[test]
+    fn a_failure_only_on_a_flaky_test_is_not_the_writers() {
+        let mut state = Map::new();
+        let output = "FAILED tests/a.py::test_x - AssertionError: assert 0 == 1\n";
+        let (text, flaky_only) = classify(Path::new("."), "pytest", false, output, 1.0, &["src/b.py".to_string()],
+            &mut state, &json!({}), &known(&[("tests/a.py::test_x", 20.0, 4.0)]));
+        assert!(flaky_only);
+        assert!(text.contains("only `tests/a.py::test_x` failed, which is flaky in this repo (failed 4/20 runs on unchanged code): not your change"), "{text}");
+        assert!(!text.contains("newly failing") && !text.contains("AssertionError"), "nothing to chase: {text}");
+        assert_eq!(state["last"]["flaky_only"], json!(true));
+    }
+
+    #[test]
+    fn real_failures_come_first_and_the_flaky_one_is_named_after() {
+        let mut state = Map::new();
+        let output = "FAILED tests/a.py::test_x - boom\nFAILED tests/a.py::test_real - assert 1 == 2\n";
+        let (text, flaky_only) = classify(Path::new("."), "pytest", false, output, 1.0, &[], &mut state, &json!({}),
+            &known(&[("tests/a.py::test_x", 9.0, 2.0)]));
+        assert!(!flaky_only);
+        let real = text.find("newly failing (1): tests/a.py::test_real").expect(&text);
+        let flaky = text
+            .find("also failed, flaky in this repo (not your change): `tests/a.py::test_x` (failed 2/9 runs on unchanged code)")
+            .expect(&text);
+        assert!(real < flaky, "{text}");
+        assert!(!text.contains("boom"), "the flaky test's own lines are left out: {text}");
+    }
+
+    #[test]
+    fn a_flaky_test_flipping_is_not_called_a_conflict() {
+        let mut state = Map::new();
+        let k = known(&[("t::x", 4.0, 2.0)]);
+        for out in ["FAILED t::x\n", "", "FAILED t::x\n"] {
+            let (text, _) = classify(Path::new("."), "pytest", out.is_empty(), out, 1.0, &[], &mut state, &json!({}), &k);
+            assert!(!text.contains("alternating") && !text.contains("now passing: t::x"), "{text}");
+        }
+    }
 }

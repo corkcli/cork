@@ -1,19 +1,15 @@
 [package]
-name = "collide-core"
+name = "cork-core"
 version = "0.1.0"
 edition = "2021"
-description = "Collide's parse + graph hot path in Rust: the work that runs on every report_edit"
+description = "Cork's parse + graph hot path in Rust: the work that runs on every report_edit"
 license = "MIT"
 
 [lib]
-name = "collide_core"
-crate-type = ["cdylib", "rlib"]
+name = "cork_core"
+crate-type = ["rlib"]
 
 [dependencies]
-# `extension-module` leaves libpython symbols undefined, which is right for
-# the Python wheel and fatal for anything that links this as a normal crate.
-# It is therefore behind the `python` feature, which pyproject.toml turns on.
-pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
 sha2 = "0.10"
 sha1 = "0.10"
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -29,10 +25,6 @@ tree-sitter-ruby = "0.23"
 tree-sitter-c = "0.23"
 tree-sitter-cpp = "0.23"
 tree-sitter-php = "0.23"
-
-[features]
-default = ["python"]
-python = ["dep:pyo3"]
 
 [profile.release]
 opt-level = 3

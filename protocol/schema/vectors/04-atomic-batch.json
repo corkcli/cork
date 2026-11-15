@@ -1,0 +1,250 @@
+{
+  "name": "An atomic batch is all or nothing",
+  "description": "Two-phase: every op is checked first. One conflicting op rejects the whole batch (the others get batch_aborted) and nothing is applied or logged; the corrected batch lands as one log entry.",
+  "steps": [
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "alice-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "bob-1",
+        "agent_id": "codex-b",
+        "person": "bob@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "bob-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 1,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.1",
+        "key": "code:src/api.py::b",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "modify_body",
+        "hlc": {
+          "w": 1,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "ack",
+            "version": 1,
+            "seq": 1,
+            "hash": "$bind:hb"
+          }
+        }
+      ]
+    },
+    {
+      "at": 2,
+      "conn": "alice",
+      "send": {
+        "t": "batch",
+        "batch_id": "alice-1.b1",
+        "atomic": true,
+        "ops": [
+          {
+            "op_id": "alice-1.1",
+            "key": "code:src/api.py::a",
+            "base": {
+              "version": 0,
+              "hash": ""
+            },
+            "kind": "signature_change",
+            "public": {
+              "new_signature": "(req, ctx)"
+            },
+            "hlc": {
+              "w": 2,
+              "c": 0
+            }
+          },
+          {
+            "op_id": "alice-1.2",
+            "key": "code:src/api.py::b",
+            "base": {
+              "version": 0,
+              "hash": ""
+            },
+            "kind": "modify_body",
+            "hlc": {
+              "w": 2,
+              "c": 0
+            }
+          },
+          {
+            "op_id": "alice-1.3",
+            "key": "code:src/api.py::c",
+            "base": {
+              "version": 0,
+              "hash": ""
+            },
+            "kind": "modify_body",
+            "hlc": {
+              "w": 2,
+              "c": 0
+            }
+          }
+        ]
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "reject",
+            "op_id": "alice-1.2",
+            "reason": "conflict",
+            "batch_id": "alice-1.b1"
+          }
+        },
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "reject",
+            "op_id": "alice-1.1",
+            "reason": "batch_aborted",
+            "batch_id": "alice-1.b1"
+          }
+        },
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "reject",
+            "op_id": "alice-1.3",
+            "reason": "batch_aborted",
+            "batch_id": "alice-1.b1"
+          }
+        }
+      ]
+    },
+    {
+      "at": 3,
+      "conn": "alice",
+      "send": {
+        "t": "batch",
+        "batch_id": "alice-1.b2",
+        "atomic": true,
+        "ops": [
+          {
+            "op_id": "alice-1.1",
+            "key": "code:src/api.py::a",
+            "base": {
+              "version": 0,
+              "hash": ""
+            },
+            "kind": "signature_change",
+            "public": {
+              "new_signature": "(req, ctx)"
+            },
+            "hlc": {
+              "w": 3,
+              "c": 0
+            }
+          },
+          {
+            "op_id": "alice-1.2",
+            "key": "code:src/api.py::b",
+            "base": {
+              "version": 1,
+              "hash": "$ref:hb"
+            },
+            "kind": "modify_body",
+            "hlc": {
+              "w": 3,
+              "c": 0
+            }
+          },
+          {
+            "op_id": "alice-1.3",
+            "key": "code:src/api.py::c",
+            "base": {
+              "version": 0,
+              "hash": ""
+            },
+            "kind": "modify_body",
+            "hlc": {
+              "w": 3,
+              "c": 0
+            }
+          }
+        ]
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "op_id": "alice-1.1",
+            "version": 1,
+            "seq": 2,
+            "batch_id": "alice-1.b2"
+          }
+        },
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "op_id": "alice-1.2",
+            "version": 2,
+            "seq": 2,
+            "batch_id": "alice-1.b2"
+          }
+        },
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "op_id": "alice-1.3",
+            "version": 1,
+            "seq": 2,
+            "batch_id": "alice-1.b2"
+          }
+        }
+      ]
+    }
+  ]
+}

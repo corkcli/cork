@@ -4,10 +4,9 @@
 //! a Firebase ID token, and those resolve with one KV read: tokens are stored
 //! hashed, so a database leak never leaks a usable credential.
 //!
-//! Firebase ID tokens are not handled here yet. The endpoints that need them
-//! (dashboard sign-in, and `oauth::approve` which the dashboard calls with
-//! one) are still served by the Python half — `principal_for_bearer` below
-//! only ever resolves the `cat_…` shape.
+//! `principal_for_bearer` below only ever resolves the `cat_…` shape. The
+//! dashboard's identity (Firebase ID tokens, and `test:` tokens when test
+//! auth is on) is `DashboardAuth`, further down.
 
 use serde_json::Value;
 
@@ -17,10 +16,18 @@ pub const TOKEN_BUCKET: &str = "oauth_token";
 pub const MEMBER_BUCKET: &str = "member";
 /// Prefixes that make a bearer token self-describing at a glance (in logs,
 /// in `oauth::token`'s grant-type branches) without a KV lookup. Minted by
-/// `oauth::mint_tokens`; Python's `auth.py` owns the same two constants for
-/// the same reason — `oauth.py` imports them rather than hardcoding "cat_".
+/// `oauth::mint_tokens`.
 pub const ACCESS_TOKEN_PREFIX: &str = "cat_";
 pub const REFRESH_TOKEN_PREFIX: &str = "crt_";
+/// An unclaimed anonymous agent's token (`oauth::agent_identity`): kind
+/// `sandbox` in the token bucket, so `principal_for_bearer`, and every
+/// surface that resolves a credential through it, refuses it outright. Only
+/// the MCP endpoint asks `sandbox_principal` for one.
+pub const SANDBOX_TOKEN_PREFIX: &str = "csb_";
+/// Agent registrations (`oauth::agent_identity`), by registration id.
+pub const AGENT_REG_BUCKET: &str = "agent_reg";
+/// The only repos a sandbox token may name: `sandbox/<anything>`.
+pub const SANDBOX_REPO_PREFIX: &str = "sandbox/";
 
 /// Tokens are stored hashed: a DB leak never leaks a usable credential.
 /// `pub` (not `pub(crate)`-only-by-accident) because `oauth.rs` — a sibling
@@ -49,9 +56,11 @@ pub struct Principal {
     pub workspaces: Vec<String>,
     /// The numeric id of the GitHub account linked to this Firebase login
     /// (`firebase.identities["github.com"]` in the ID token), empty when the
-    /// login has none or the credential is not a Firebase one. The one GitHub
-    /// account whose token this login may store: repo access comes from
-    /// signing in with GitHub, never from a token some other login produced.
+    /// login has none or the credential is not a Firebase one. GitHub is a
+    /// sign-in only and Cork keeps no GitHub token, so nothing gates on
+    /// this today; it stays resolved because it is the sign-in's own record
+    /// of which GitHub account it is.
+    #[allow(dead_code)]
     pub github_id: String,
     /// Firebase's own `email_verified` claim: the address was proven (a Google
     /// sign-in, a verified email link). False for every non-Firebase
@@ -98,6 +107,72 @@ pub fn principal_for_bearer(store: &Store, header: Option<&str>, now: f64) -> Op
     })
 }
 
+/// An unclaimed anonymous agent behind a sandbox token: its own sandbox
+/// workspace and nothing else. None unless the token is live AND its
+/// registration is still unclaimed and unexpired, so claiming or expiring a
+/// registration ends every token it was given at once, whatever their own
+/// expiry says.
+pub fn sandbox_principal(store: &Store, header: Option<&str>, now: f64) -> Option<Principal> {
+    let (scheme, token) = header?.split_once(' ')?;
+    let token = token.trim();
+    if !scheme.eq_ignore_ascii_case("bearer") || !token.starts_with(SANDBOX_TOKEN_PREFIX) {
+        return None;
+    }
+    let record = store.kv_get(TOKEN_BUCKET, &token_key(token))?;
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    if text(&record, "kind") != "sandbox" || record.get("expires").and_then(Value::as_f64).unwrap_or(0.0) <= now {
+        return None;
+    }
+    let registration = store.kv_get(AGENT_REG_BUCKET, &text(&record, "registration"))?;
+    let workspace = text(&record, "workspace");
+    if text(&registration, "status") != "unclaimed"
+        || registration.get("expires").and_then(Value::as_f64).unwrap_or(0.0) <= now
+        || workspace.is_empty()
+        || text(&registration, "sandbox_ws") != workspace
+    {
+        return None;
+    }
+    Some(Principal {
+        uid: text(&record, "uid"),
+        email: String::new(),
+        name: "sandbox agent".to_string(),
+        workspaces: vec![workspace.clone()],
+        workspace,
+        github_id: String::new(),
+        email_verified: false,
+    })
+}
+
+/// A repo a sandbox token may name: `sandbox/<name>`, nothing else.
+pub fn is_sandbox_repo(repo_id: &str) -> bool {
+    let repo = repo_id.trim().to_ascii_lowercase();
+    repo.len() > SANDBOX_REPO_PREFIX.len() && repo.starts_with(SANDBOX_REPO_PREFIX) && !repo.contains("..")
+}
+
+/// The dashboard page where a person does what an agent was refused:
+/// `<dashboard>/dashboard/settings?workspace=<id>&section=<section>`.
+pub fn settings_link(dashboard: &str, workspace: &str, section: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if !workspace.is_empty() {
+        query.append_pair("workspace", workspace);
+    }
+    query.append_pair("section", section);
+    format!("{}/dashboard/settings?{}", dashboard.trim_end_matches('/'), query.finish())
+}
+
+/// An agent's credential by its shape: every token this server mints for an
+/// agent or a machine (`cat_` access, `crt_` refresh, `csb_` sandbox) and
+/// any other `<letters>_` token it may mint later. A person's dashboard
+/// session is a Firebase ID token (a JWT, `eyJ…`) or, under the test suite,
+/// `test:…`.
+pub fn is_agent_token(token: &str) -> bool {
+    let token = token.trim();
+    token.starts_with(ACCESS_TOKEN_PREFIX)
+        || token.starts_with(REFRESH_TOKEN_PREFIX)
+        || token.starts_with(SANDBOX_TOKEN_PREFIX)
+        || token.split_once('_').is_some_and(|(prefix, _)| (2..=4).contains(&prefix.len()) && prefix.chars().all(|c| c.is_ascii_lowercase()))
+}
+
 /// The membership record, which also carries the read/write access level.
 /// A per-repo access list comes back rename-aware (see
 /// [`with_repo_renames`]), so every access check reads the same list.
@@ -118,7 +193,6 @@ pub fn member(store: &Store, workspace_id: &str, uid: &str) -> Option<Value> {
 /// repo everywhere but a direct call, while "every repo" worked. Both names
 /// (and any chain of renames) count as the same repo. "*" and a missing
 /// list are untouched — nothing to widen, and no extra read on that path.
-/// Twin of Python's `workspaces.with_repo_renames`.
 pub fn with_repo_renames(store: &Store, workspace_id: &str, mut record: Value) -> Value {
     let Some(list) = record.get("repos").and_then(Value::as_array).cloned() else { return record };
     let prefix = format!("{workspace_id}:");
@@ -165,7 +239,7 @@ pub fn is_read_only(member: Option<&Value>) -> bool {
 
 // ------------------------------------------------- the dashboard's identity
 
-/// Who is asking, resolved in the same order the Python half tries: a
+/// Who is asking, resolved in this order: a
 /// workspace-bound `cat_` token, then a `test:` token when test auth is on,
 /// then a Firebase ID token. The order is load-bearing — a `cat_` token is
 /// looked up, never decoded, and must never fall through to the JWT path.
@@ -180,9 +254,9 @@ pub struct DashboardAuth {
 
 impl DashboardAuth {
     pub fn from_env() -> Self {
-        let env = |key: &str| std::env::var(key).unwrap_or_default().trim().to_string();
+        let env = |key: &str| crate::env::var(key).unwrap_or_default().trim().to_string();
         Self {
-            test_mode: env("COLLIDE_TEST_AUTH") == "1",
+            test_mode: env("CORK_TEST_AUTH") == "1",
             firebase_project_id: env("FIREBASE_PROJECT_ID"),
             firebase_emulator: !env("FIREBASE_AUTH_EMULATOR_HOST").is_empty(),
         }
@@ -197,27 +271,65 @@ impl DashboardAuth {
             return principal_for_bearer(store, Some(&format!("Bearer {token}")), now);
         }
         if self.test_mode && token.starts_with("test:") {
-            // "test:<uid>[:<workspace>]" — the moral equivalent of a real
-            // credential for the suite, and nothing else ever
+            // "test:<uid>[:<workspace>[:<email>]]" — the moral equivalent of
+            // a real credential for the suite, and nothing else ever
             let mut parts = token.split(':');
             parts.next();
             let uid = parts.next().unwrap_or("").to_string();
             if uid.is_empty() {
                 return None;
             }
+            let workspace = parts.next().unwrap_or("").to_string();
+            let email = parts.next().unwrap_or("").to_string();
             return Some(Principal {
                 uid: uid.clone(),
-                email: String::new(),
+                email_verified: !email.is_empty(),
+                email,
                 name: uid,
-                workspace: parts.next().unwrap_or("").to_string(),
+                workspace,
                 workspaces: Vec::new(),
-                github_id: String::new(), email_verified: false,
+                github_id: String::new(),
             });
         }
         if !self.firebase_project_id.is_empty() {
             return self.verify_firebase(token, now);
         }
         None
+    }
+
+    /// The person behind a dashboard session, and never an agent: a bearer
+    /// that is an agent's credential (an OAuth access or refresh token, a
+    /// hook or machine credential, all `cat_`/`crt_`) is refused here though
+    /// `principal_of` accepts it. For the routes that mint or widen a
+    /// credential: an agent holding a token narrowed to one workspace must
+    /// not approve itself one for all of them.
+    pub fn person_of(&self, store: &Store, headers: &axum::http::HeaderMap, now: f64) -> Option<Principal> {
+        let bearer = headers.get("authorization").and_then(|value| value.to_str().ok()).unwrap_or("");
+        let token = bearer.split_once(' ').map(|(_, token)| token.trim()).unwrap_or("");
+        if is_agent_token(token) {
+            return None;
+        }
+        self.principal_of(store, headers, "", now)
+    }
+
+    /// An owner power (inviting people, changing a member's access or
+    /// removing them, transferring the workspace, answering seat requests,
+    /// PR checks' reading mode, the privacy switches): the person, signed in
+    /// at the dashboard. An agent's token, however much it may otherwise do,
+    /// gets a 403 naming the page (`page`) where its person does this; no
+    /// credential at all, a 401.
+    pub fn owner_power(&self, store: &Store, headers: &axum::http::HeaderMap, now: f64, page: &str) -> Result<Principal, Refusal> {
+        let bearer = headers.get("authorization").and_then(|value| value.to_str().ok()).unwrap_or("");
+        let token = bearer.split_once(' ').map(|(_, token)| token.trim()).unwrap_or("");
+        if is_agent_token(token) {
+            return Err((403, serde_json::json!({
+                "ok": false,
+                "code": "person_required",
+                "error": format!("an agent cannot do this: only a person, signed in to Cork, can. Ask your person to do it at {page}"),
+                "dashboard": page,
+            })));
+        }
+        self.person_of(store, headers, now).ok_or_else(|| (401, serde_json::json!({"error": "unauthorized"})))
     }
 
     /// Bearer header first; explicit `?token=` second, for WebSocket-style
@@ -241,9 +353,8 @@ impl DashboardAuth {
     }
 
     /// A Firebase ID token: RS256 against Google's published keys, audience
-    /// the project, issuer `securetoken.google.com/<project>`. Python loads
-    /// the x509 certificates; this reads the same keys from the JWK endpoint,
-    /// which is the same material in a form the verifier consumes directly.
+    /// the project, issuer `securetoken.google.com/<project>`. The keys come
+    /// from the JWK endpoint, in a form the verifier consumes directly.
     fn verify_firebase(&self, token: &str, now: f64) -> Option<Principal> {
         use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
         let issuer = format!("https://securetoken.google.com/{}", self.firebase_project_id);
@@ -404,7 +515,7 @@ pub struct AuthUser {
     pub workspaces: Vec<String>,
 }
 
-/// A refusal a route returns as-is: status and body, exactly as Python's.
+/// A refusal a route returns as-is: status and body.
 pub type Refusal = (u16, Value);
 
 /// Resolve a principal against one workspace, enforcing membership. A

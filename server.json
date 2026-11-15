@@ -1,18 +1,24 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.lithometric/collide",
-  "title": "Collide",
-  "description": "Run multiple AI coding agents on one repo without conflicts: live awareness, a write gate, briefings and agent messaging.",
+  "name": "com.corkcli/mcp",
+  "title": "Cork",
+  "description": "Keeps AI coding agents on one codebase from overwriting each other, and briefs each on its code.",
   "repository": {
-    "url": "https://github.com/lithometric/collidemcp",
+    "url": "https://github.com/lithometric/cork",
     "source": "github"
   },
-  "websiteUrl": "https://collidemcp.com",
+  "websiteUrl": "https://corkcli.com",
   "version": "1.0.0",
+  "icons": [
+    {
+      "src": "https://corkcli.com/brand/cork-mark-black.svg",
+      "mimeType": "image/svg+xml"
+    }
+  ],
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://mcp.collidemcp.com/mcp"
+      "url": "https://mcp.corkcli.com"
     }
   ]
 }

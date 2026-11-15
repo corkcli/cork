@@ -1,19 +1,16 @@
-//! `collide-hook login`: connect this repo from the terminal, no agent in the
-//! loop. The Claude Code plugin's front door.
+//! `cork login`: link this machine to a Cork account from the
+//! terminal, no agent in the loop. The Claude Code plugin's front door.
 //!
-//! 1. the browser signs in (the same OAuth the MCP clients use: dynamic
-//!    registration, PKCE, a loopback redirect to a port this process holds);
-//! 2. `POST /plugin/connect` turns that sign-in into what `setup` would have
-//!    left on disk for this repo: `.collide/config.json` and a hook
-//!    credential;
-//! 3. the credential is merged into `~/.collide/credentials.json` the way
-//!    `add-credentials` merges one (other servers' and workspaces' keys stay).
+//! The browser signs in (the same OAuth the MCP clients use: dynamic
+//! registration, PKCE, a loopback redirect to a port this process holds),
+//! and the machine's login (machine.rs) turns that into the machine's
+//! credential, merged into `~/.collide/credentials.json` the way
+//! `add-credentials` merges one (other servers' and workspaces' keys stay).
 //!
 //! Nothing here is sent to a model, and the token never touches the repo.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -22,7 +19,6 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{self, Env};
 
-const DEFAULT_SERVER: &str = "https://mcp.collidemcp.com";
 const WAIT: Duration = Duration::from_secs(300);
 
 fn random_token() -> String {
@@ -116,10 +112,10 @@ fn wait_for_callback(listener: &TcpListener) -> Option<String> {
                 }
                 let ok = !query_param(query, "code").is_empty();
                 let body = if ok {
-                    "<!doctype html><meta charset=utf-8><title>Collide</title><body style=\"font:16px system-ui;margin:3em\">\
-<h1 style=\"font-size:20px\">Collide is connected.</h1><p>You can close this tab and go back to your terminal.</p>"
+                    "<!doctype html><meta charset=utf-8><title>Cork</title><body style=\"font:16px system-ui;margin:3em\">\
+<h1 style=\"font-size:20px\">Cork is connected.</h1><p>You can close this tab and go back to your terminal.</p>"
                 } else {
-                    "<!doctype html><meta charset=utf-8><title>Collide</title><body style=\"font:16px system-ui;margin:3em\">\
+                    "<!doctype html><meta charset=utf-8><title>Cork</title><body style=\"font:16px system-ui;margin:3em\">\
 <h1 style=\"font-size:20px\">Sign-in did not finish.</h1><p>Go back to your terminal and run the login again.</p>"
                 };
                 let _ = stream.write_all(
@@ -139,21 +135,15 @@ fn http() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build()
 }
 
-fn repo_root(cwd: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]).current_dir(cwd).output().ok()?;
-    let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !top.is_empty()).then(|| PathBuf::from(top))
-}
-
 /// The browser sign-in, the same OAuth the MCP clients use (dynamic
 /// registration, PKCE, a loopback redirect to a port this process holds).
 /// Returns the access token.
 pub fn sign_in(server: &str, env: &Env) -> Result<String, String> {
-    sign_in_as(server, env, "Collide for Claude Code")
+    sign_in_as(server, env, "Cork for Claude Code")
 }
 
-/// The same, registering as `client_name`: Collide's server tells a
-/// `collide upgrade` from a `collide login` from the plugin by it.
+/// The same, registering as `client_name`: Cork's server tells a
+/// `cork upgrade` from a `cork login` from the plugin by it.
 pub fn sign_in_as(server: &str, env: &Env, client_name: &str) -> Result<String, String> {
     let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
         return Err("could not open a local port for the browser to return to".into());
@@ -161,10 +151,10 @@ pub fn sign_in_as(server: &str, env: &Env, client_name: &str) -> Result<String, 
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let redirect = format!("http://127.0.0.1:{port}/callback");
     // registered portless: a native client arrives on whatever port it got (RFC 8252 s7.3)
-    let registered = http()
-        .post(&format!("{server}/register"))
-        .send_json(json!({"client_name": client_name, "redirect_uris": ["http://127.0.0.1/callback"],
-                          "grant_types": ["authorization_code"], "token_endpoint_auth_method": "none"}));
+    let registration = json!({"client_name": client_name, "redirect_uris": ["http://127.0.0.1/callback"],
+                              "grant_types": ["authorization_code"], "token_endpoint_auth_method": "none"});
+    crate::http::audit_raw("POST", &format!("{server}/register"), &registration.to_string());
+    let registered = http().post(&format!("{server}/register")).send_json(registration);
     let Some(client_id) = registered.ok().and_then(|r| r.into_json::<Value>().ok())
         .and_then(|v| v.get("client_id").and_then(Value::as_str).map(str::to_string))
     else {
@@ -177,8 +167,13 @@ pub fn sign_in_as(server: &str, env: &Env, client_name: &str) -> Result<String, 
         "{server}/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge={challenge}&code_challenge_method=S256&state={state}",
         encode(&client_id), encode(&redirect)
     );
-    println!("Opening your browser to sign in to Collide. If it does not open, visit:\n  {url}");
-    if config::get(env, "COLLIDE_NO_BROWSER") != "1" {
+    // from an install, whose heading already says a browser opens
+    if config::get(env, "CORK_STYLE") == "1" {
+        println!("  {}\n  {url}", crate::machine::Paint::new(env).dim("if your browser does not open, visit:"));
+    } else {
+        println!("Opening your browser to sign in to Cork. If it does not open, visit:\n  {url}");
+    }
+    if config::get(env, "CORK_NO_BROWSER") != "1" {
         open_browser(&url);
     }
     let Some(query) = wait_for_callback(&listener) else {
@@ -191,10 +186,14 @@ pub fn sign_in_as(server: &str, env: &Env, client_name: &str) -> Result<String, 
     if code.is_empty() {
         return Err(format!("sign-in was cancelled ({})", query_param(&query, "error")));
     }
-    let exchanged = http().post(&format!("{server}/token")).send_form(&[
-        ("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", &redirect),
-        ("client_id", &client_id), ("code_verifier", &verifier),
-    ]);
+    let form = [
+        ("grant_type", "authorization_code"), ("code", code.as_str()), ("redirect_uri", redirect.as_str()),
+        ("client_id", client_id.as_str()), ("code_verifier", verifier.as_str()),
+    ];
+    // the log masks the code and the verifier
+    crate::http::audit_raw("POST", &format!("{server}/token"),
+        &form.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&"));
+    let exchanged = http().post(&format!("{server}/token")).send_form(&form);
     let Some(access) = exchanged.ok().and_then(|r| r.into_json::<Value>().ok())
         .and_then(|v| v.get("access_token").and_then(Value::as_str).map(str::to_string))
     else {
@@ -203,94 +202,19 @@ pub fn sign_in_as(server: &str, env: &Env, client_name: &str) -> Result<String, 
     Ok(access)
 }
 
+/// `cork login`: link this machine to a Cork account. Cork is
+/// installed per machine, so the sign-in is the machine's, from any folder;
+/// a repo is never set up on its own any more (no `.collide/config.json` is
+/// written).
 pub fn run(args: &[String], env: &Env) -> i32 {
-    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned().unwrap_or_default();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    // Collide installed for the machine: the login is the machine's, from
-    // anywhere, unless asked for one repo (--repo) inside a repo set up alone
-    if crate::machine::installed(env) && arg("--repo").is_empty() && !args.iter().any(|a| a == "--this-repo") {
+    if crate::machine::installed(env) {
         return crate::machine::login(args, env);
     }
-    let Some(root) = repo_root(&cwd) else {
-        println!("Collide login: run this inside the git repository you want to connect.");
-        return 1;
-    };
-    let existing = config::load_json(&root.join(".collide").join("config.json"));
-    let server = {
-        let given = arg("--server");
-        let from_repo = existing.get("server_url").and_then(Value::as_str).unwrap_or("").to_string();
-        let chosen = if !given.is_empty() { given } else if !from_repo.is_empty() { from_repo } else { DEFAULT_SERVER.to_string() };
-        chosen.trim_end_matches('/').to_string()
-    };
-    let repo_id = {
-        let given = arg("--repo");
-        let from_repo = existing.get("repo_id").and_then(Value::as_str).unwrap_or("").to_string();
-        if !given.is_empty() { given } else if !from_repo.is_empty() { from_repo } else { crate::git::origin_repo_id(&root) }
-    };
-    if repo_id.is_empty() {
-        println!("Collide login: this repository has no origin remote to name it by. Run again with --repo github.com/you/project.");
-        return 1;
-    }
-
-    let access = match sign_in(&server, env) {
-        Ok(access) => access,
-        Err(problem) => {
-            println!("Collide login: {problem}.");
-            return 1;
-        }
-    };
-    let connected = http()
-        .post(&format!("{server}/plugin/connect"))
-        .set("Authorization", &format!("Bearer {access}"))
-        .send_json(json!({"repo_id": repo_id}))
-        .ok()
-        .and_then(|r| r.into_json::<Value>().ok())
-        .unwrap_or(Value::Null);
-    if connected.get("ok").and_then(Value::as_bool) != Some(true) {
-        let why = connected.get("reason").or_else(|| connected.get("access_denied")).and_then(Value::as_str).unwrap_or("");
-        println!("Collide login: this account cannot connect {repo_id}{}.", if why.is_empty() { String::new() } else { format!(" ({why})") });
-        return 1;
-    }
-
-    // the credential: merged, never replacing another server's or workspace's keys
-    // only this server's keys: a bare "token" would become every other
-    // repo's fallback and mix this workspace's credential into theirs
-    let fragment: serde_json::Map<String, Value> = connected
-        .get("credentials")
-        .and_then(Value::as_object)
-        .map(|m| m.iter().filter(|(k, _)| k.starts_with(&server)).map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
-    let fragment = Value::Object(fragment);
-    let scratch = std::env::temp_dir().join(format!("collide-login-{}.json", std::process::id()));
-    if std::fs::write(&scratch, fragment.to_string()).is_err() || crate::report::add_credentials(&scratch.to_string_lossy(), env) != 0 {
-        let _ = std::fs::remove_file(&scratch);
-        println!("Collide login: signed in, but the credential could not be saved to ~/.collide/credentials.json.");
-        return 1;
-    }
-    let _ = std::fs::remove_file(&scratch);
-
-    // the repo config: written when there is none; an existing one is the team's and stays
-    let config_path = root.join(".collide").join("config.json");
-    let wrote_config = if existing.as_object().map_or(true, |m| m.is_empty()) {
-        let _ = std::fs::create_dir_all(root.join(".collide"));
-        let body = connected.get("config").cloned().unwrap_or(Value::Null);
-        std::fs::write(&config_path, format!("{}\n", serde_json::to_string_pretty(&body).unwrap_or_default())).is_ok()
-    } else {
-        false
-    };
-    let who = connected.get("user").and_then(Value::as_str).unwrap_or("");
-    let workspace = connected.get("workspace_name").and_then(Value::as_str).filter(|w| !w.is_empty())
-        .or_else(|| connected.get("workspace").and_then(Value::as_str)).unwrap_or("");
     println!(
-        "Collide is on for {repo_id}{}, workspace {workspace}.{}",
-        if who.is_empty() { String::new() } else { format!(": signed in as {who}") },
-        if wrote_config {
-            " Wrote .collide/config.json; commit it so teammates' agents join the same repo."
-        } else {
-            ""
-        }
+        "Cork login: Cork is not installed on this machine yet. Install it once for every repo with: \
+curl -fsSL https://corkcli.com/install.sh | sh  (or call Cork's setup tool from your agent), then run cork login."
     );
-    0
+    1
 }
 
 #[cfg(test)]

@@ -361,8 +361,9 @@ const MAX_NOTE: usize = 500;
 /// because "the Stripe migration here is half-done" stays true long after
 /// whoever noticed it has stopped running. `supervise::fire_tripwires`
 /// matches them on every report.
+#[allow(clippy::too_many_arguments)]
 pub fn defer(
-    store: &Store, scope: &str, user_id: &str, agent: &str,
+    store: &Store, scope: &str, user_id: &str, session: &str, agent: &str,
     paths: &[String], symbols: &[String], note: &str, expires_days: f64,
 ) -> Value {
     let note: String = note.trim().chars().take(MAX_NOTE).collect();
@@ -375,6 +376,8 @@ pub fn defer(
     let tripwire = json!({
         "id": id,
         "owner": user_id,
+        // whose leftover it is: that session's handoff carries it (handoff.rs)
+        "session": session,
         "agent": agent,
         "note": note,
         "paths": paths,
@@ -402,6 +405,65 @@ const TURN_NOTE_CHARS: usize = 400;
 /// while agents declared intents; the hooks stopped them declaring, and the
 /// notes stopped with them. One note per turn, never one per symbol.
 pub fn settle_turn(store: &Store, scope: &str, user_id: &str, session: &str, summary: &str, agent: &str) -> Value {
+    settle_turn_for(store, scope, user_id, session, "", summary, agent)
+}
+
+/// Whether a turn's closing words say where unfinished work stands ("the
+/// helper is still building the frontend, only dom.js so far"): a status,
+/// true while the agent that wrote it works, not a fact about the code.
+pub fn in_progress(text: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(concat!(
+            r"(?i)\b(?:still|so far|in progress|under ?way|not (?:yet|done|finished)|waiting (?:for|on)|working on|",
+            r"halfway|partially|remaining|is building|are building|next,? i(?:'ll| will))\b"
+        ))
+        .expect("in-progress pattern")
+    })
+    .is_match(text)
+}
+
+/// The in-progress turn notes one agent of a session left: the session's
+/// lead (`worker` empty) or one of its helpers.
+fn status_key(scope: &str, session: &str, worker: &str) -> String {
+    format!("turnstatus:{scope}:{session}/{worker}")
+}
+
+/// Retire the in-progress notes an agent left: a newer turn of it said where
+/// things stand now, its helper finished, or its session ended. A status
+/// kept past the agent that wrote it reads as a fact about the code ("still
+/// building the frontend") long after the build was done.
+pub fn end_status_notes(store: &Store, scope: &str, session: &str, worker: &str) {
+    if session.is_empty() {
+        return;
+    }
+    let key = status_key(scope, session, worker);
+    let ids: Vec<String> = store
+        .eph_get(&key)
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    let stamp = now();
+    for id in ids {
+        let note_key = format!("{scope}:{id}");
+        if let Some(mut note) = store.kv_get("memory", &note_key) {
+            if let Some(map) = note.as_object_mut() {
+                map.insert("withdrawn".into(), json!(true));
+                map.insert("withdrawn_why".into(), json!("a status of work in progress, ended with the agent that wrote it"));
+            }
+            let _ = store.kv_put("memory", &note_key, &note, stamp);
+        }
+    }
+    store.eph_delete(&key);
+}
+
+/// `settle_turn` for one agent of the session (a helper when `worker` names one).
+pub fn settle_turn_for(
+    store: &Store, scope: &str, user_id: &str, session: &str, worker: &str, summary: &str, agent: &str,
+) -> Value {
     let stamp = now();
     let key = format!("settledturn:{scope}:{session}");
     let since = store
@@ -413,6 +475,8 @@ pub fn settle_turn(store: &Store, scope: &str, user_id: &str, session: &str, sum
     if session.is_empty() || gist.chars().count() < 40 {
         return json!({"ok": true, "saved": 0});
     }
+    // where this agent's work stood last turn is past now
+    end_status_notes(store, scope, session, worker);
     let mut changed: Vec<(String, String)> = Vec::new();
     for row in store.ledger_since_kinds(scope, since, &["edit_reported"]) {
         let payload = &row.payload;
@@ -452,6 +516,10 @@ pub fn settle_turn(store: &Store, scope: &str, user_id: &str, session: &str, sum
             supersedes: "",
         },
     );
+    // a status lasts as long as the agent that wrote it
+    if let Some(id) = saved.get("memory_id").and_then(Value::as_str).filter(|_| in_progress(&fact)) {
+        let _ = store.eph_set(&status_key(scope, session, worker), &json!([id]), Some(7.0 * 86_400.0));
+    }
     json!({"ok": true, "saved": 1, "note": saved.get("memory_id").cloned().unwrap_or(Value::Null)})
 }
 
@@ -505,4 +573,36 @@ mod settle_tests {
         let gist = turn_gist(&long);
         assert!(gist.starts_with("Done.") && gist.ends_with('.') && gist.chars().count() <= TURN_NOTE_CHARS, "{gist}");
     }
+
+    /// "The helper is still building the frontend, only dom.js so far" was a
+    /// status, and it stayed on dom.js long after the build was done. A turn
+    /// note that says work is under way ends with the agent that wrote it:
+    /// its next turn note, its helper's end, or its session's end.
+    #[test]
+    fn a_status_note_ends_with_the_agent_that_wrote_it() {
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let scope = "w:r";
+        let edit = |path: &str| {
+            // after the last turn's settling, never in the same instant
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = store.ledger_append(scope, "edit_reported", &json!({"user": "a@x", "session": "s1", "path": path,
+                "symbols_changed": {"mount": {"before": "h1", "after": "h2"}}}), now());
+        };
+        let withdrawn = |id: &str| store.kv_get("memory", &format!("{scope}:{id}")).and_then(|m| m.get("withdrawn").cloned()) == Some(json!(true));
+        edit("static/js/dom.js");
+        let status = settle_turn(&store, scope, "a@x", "s1", "The helper is still building the frontend, only dom.js so far; issue.js is next.", "claude");
+        let id = status["note"].as_str().unwrap().to_string();
+        assert!(!withdrawn(&id));
+        // the next turn says where things stand: the old status ends
+        edit("static/js/issue.js");
+        let done = settle_turn(&store, scope, "a@x", "s1", "Built issue.js on top of dom.js: mountIssue renders the issue view with its labels.", "claude");
+        assert!(withdrawn(&id), "superseded by the next turn");
+        let fact_id = done["note"].as_str().unwrap().to_string();
+        // a fact about the code stays; a status left at the session's end goes with it
+        edit("static/css/app.css");
+        let last = settle_turn(&store, scope, "a@x", "s1", "Styles for the five classes are in progress: chip-project and ws-name so far.", "claude");
+        end_status_notes(&store, scope, "s1", "");
+        assert!(withdrawn(last["note"].as_str().unwrap()) && !withdrawn(&fact_id));
+    }
+
 }

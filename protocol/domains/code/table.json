@@ -1,0 +1,45 @@
+{
+  "domain": "code",
+  "version": 1,
+  "prefixes": ["code:", "file:"],
+  "coalesce_ms": 0,
+  "kinds": {
+    "modify_body":      { "doc": "Change a symbol's body; its name and signature stay.", "public": [], "keys": ["code:"] },
+    "signature_change": { "doc": "Change a symbol's parameters, return type or decorators.", "public": ["new_signature"], "keys": ["code:"] },
+    "rename":           { "doc": "Rename a symbol in place. public.new_name replaces the last segment of the symbol, or the whole symbol path when it contains a dot.", "public": ["new_name"], "moves_key": true, "keys": ["code:"] },
+    "insert":           { "doc": "Create a symbol at this key.", "public": [], "keys": ["code:"] },
+    "delete":           { "doc": "Remove the symbol or file.", "public": [] },
+    "move":             { "doc": "Move a symbol (or a whole file) to public.new_path.", "public": ["new_path"], "moves_key": true },
+    "file_replace":     { "doc": "Replace a whole file: configs, lockfiles, binaries, anything without symbols.", "public": [], "keys": ["file:"] }
+  },
+  "relations": {
+    "modify_body":      { "modify_body": "conflict", "signature_change": "conflict", "rename": "rekey",    "insert": "conflict", "delete": "conflict", "move": "rekey",    "file_replace": "conflict" },
+    "signature_change": { "modify_body": "conflict", "signature_change": "conflict", "rename": "rekey",    "insert": "conflict", "delete": "conflict", "move": "rekey",    "file_replace": "conflict" },
+    "rename":           { "modify_body": "commute",  "signature_change": "commute",  "rename": "conflict", "insert": "conflict", "delete": "conflict", "move": "rekey",    "file_replace": "conflict" },
+    "insert":           { "modify_body": "conflict", "signature_change": "conflict", "rename": "commute",  "insert": "conflict", "delete": "commute",  "move": "commute",  "file_replace": "conflict" },
+    "delete":           { "modify_body": "conflict", "signature_change": "conflict", "rename": "conflict", "insert": "conflict", "delete": "commute",  "move": "conflict", "file_replace": "conflict" },
+    "move":             { "modify_body": "commute",  "signature_change": "commute",  "rename": "rekey",    "insert": "conflict", "delete": "conflict", "move": "conflict", "file_replace": "conflict" },
+    "file_replace":     { "modify_body": "conflict", "signature_change": "conflict", "rename": "conflict", "insert": "conflict", "delete": "conflict", "move": "rekey",    "file_replace": "conflict" }
+  },
+  "notes": {
+    "modify_body/modify_body": "Two bodies: the server cannot merge text it never sees. The later writer merges locally.",
+    "modify_body/signature_change": "Their new parameters change what the body may use.",
+    "modify_body/rename": "Their rename moved the symbol; the body edit follows it to the new key.",
+    "modify_body/move": "Their move put the symbol in another file; the body edit follows it.",
+    "signature_change/modify_body": "Their body was written for the old signature.",
+    "rename/modify_body": "A name and a body are independent: the rename is replayed on the new body.",
+    "rename/signature_change": "A name and a parameter list compose when the rename is replayed as a typed op.",
+    "rename/rename": "Two new names for one symbol.",
+    "rename/move": "Their move took the symbol elsewhere; the rename follows it.",
+    "insert/rename": "Their rename freed this name; the new symbol takes it.",
+    "insert/delete": "Their delete freed this name; the new symbol takes it.",
+    "insert/move": "Their move freed this name; the new symbol takes it.",
+    "insert/insert": "Two symbols created under one name.",
+    "delete/delete": "Deleting twice is deleting once.",
+    "delete/modify_body": "Deleting something someone just changed: ask them first.",
+    "move/modify_body": "A move carries whatever body is current, so it composes with an edit.",
+    "move/rename": "Their rename moved the key; the move follows it.",
+    "file_replace/move": "The file moved; the replacement follows it.",
+    "file_replace/file_replace": "Two whole-file replacements: merge locally."
+  }
+}

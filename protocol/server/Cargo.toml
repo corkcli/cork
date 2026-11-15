@@ -1,0 +1,17 @@
+[package]
+name = "cork-protocol-server"
+version = "0.1.0"
+edition = "2021"
+description = "The reference server: cork-protocol's Engine over WebSockets, with the code and notes domains."
+license = "MIT"
+
+[[bin]]
+name = "cork-protocol-server"
+path = "src/main.rs"
+
+[dependencies]
+cork-protocol = { path = "../core", features = ["ws-server"] }
+cork-protocol-code = { path = "../domains/code" }
+cork-protocol-notes = { path = "../domains/notes" }
+cork-protocol-tasks = { path = "../domains/tasks" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

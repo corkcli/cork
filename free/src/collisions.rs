@@ -240,7 +240,7 @@ pub struct CheckInput<'a> {
 }
 
 /// The deepest directory (with trailing slash) every path lies under; ""
-/// when they share none. Python: merkle.common_dir.
+/// when they share none.
 pub fn common_dir(paths: &BTreeSet<String>) -> String {
     let mut sorted: Vec<&String> = paths.iter().collect();
     sorted.sort();
@@ -392,4 +392,81 @@ pub fn check_collisions(store: &Store, input: &CheckInput) -> Value {
         "fast_path_hits": fast_path_hits,
         "salience": salience,
     })
+}
+
+#[cfg(test)]
+mod diff_ported_tests {
+    use super::*;
+
+    const V1: &str = "def alpha(x):\n    return x\n\ndef beta(y):\n    return y\n";
+
+    fn symbols(src: &str) -> Map<String, Value> {
+        let out = cork_core::engine::parse("a.py", src).expect("python parses");
+        out.symbols.iter().map(|s| (s.name.clone(), json!({
+            "name": s.name, "kind": s.kind, "signature": s.signature, "hash": s.hash,
+        }))).collect()
+    }
+
+    /// Another workspace's file record after these sources, ten seconds apart.
+    fn record(sources: &[&str]) -> Value {
+        let mut record: Option<Value> = None;
+        for (i, src) in sources.iter().enumerate() {
+            let out = cork_core::engine::parse("a.py", src).expect("python parses");
+            let (next, _) = semantics::apply_parse(record.as_ref(), out.status, symbols(src), 1.0 + 10.0 * i as f64);
+            record = Some(next);
+        }
+        record.expect("at least one source")
+    }
+
+    fn summary(out: &[Value]) -> Vec<(String, String, String)> {
+        out.iter().map(|e| (text(e, "symbol"), text(e, "kind"), text(e, "confidence"))).collect()
+    }
+
+    #[test]
+    fn identical_states_collide_on_nothing() {
+        assert!(diff_against(&symbols(V1), &record(&[V1]), 100.0).is_empty());
+    }
+
+    #[test]
+    fn a_live_rename_is_certain() {
+        let out = diff_against(&symbols(V1), &record(&[V1, "def alpha(x):\n    return x\n\ndef gamma(y, z):\n    return y\n"]), 100.0);
+        assert_eq!(summary(&out), vec![("beta".into(), "renamed".into(), CERTAIN.into())]);
+        assert_eq!(out[0]["detail"]["new_name"], "gamma");
+        assert_eq!(out[0]["freshness"], "live");
+    }
+
+    #[test]
+    fn a_partial_current_parse_is_served_stale_with_its_age() {
+        let mut other = record(&[V1]);
+        let (next, _) = semantics::apply_parse(Some(&other), semantics::PARTIAL, Map::new(), 61.0);
+        other = next;
+        let viewer = symbols("def alpha(x):\n    return x + 1\n\ndef beta(y):\n    return y\n");
+        let out = diff_against(&viewer, &other, 61.0);
+        assert_eq!(summary(&out), vec![("alpha".into(), "modified".into(), LIKELY.into())]);
+        assert_eq!(out[0]["freshness"], "stale");
+        assert_eq!(out[0]["age_s"], 60.0);
+    }
+
+    #[test]
+    fn no_clean_parse_ever_stays_silent() {
+        let (broken, _) = semantics::apply_parse(None, semantics::PARTIAL, Map::new(), 1.0);
+        assert!(diff_against(&symbols(V1), &broken, 2.0).is_empty());
+    }
+
+    #[test]
+    fn one_clean_absence_is_unknown_and_two_are_a_removal() {
+        let one = "def alpha(x):\n    return x\n";
+        let out = diff_against(&symbols(V1), &record(&[V1, one]), 100.0);
+        assert_eq!(summary(&out), vec![("beta".into(), UNKNOWN.into(), UNCONFIRMED.into())]);
+        let out = diff_against(&symbols(V1), &record(&[V1, one, one]), 100.0);
+        assert_eq!(summary(&out), vec![("beta".into(), "removed".into(), CERTAIN.into())]);
+    }
+
+    #[test]
+    fn a_docstring_change_modifies_only_that_symbol() {
+        let other = record(&[V1, "def alpha(x):\n    \"\"\"doc\"\"\"\n    return x\n\ndef beta(y):\n    return y\n"]);
+        let out = diff_against(&symbols(V1), &other, 100.0);
+        assert_eq!(summary(&out), vec![("alpha".into(), "modified".into(), CERTAIN.into())]);
+        assert_eq!(out[0]["signature_change"], false);
+    }
 }

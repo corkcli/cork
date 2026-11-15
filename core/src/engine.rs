@@ -1,11 +1,8 @@
 //! The parse hot path.
 //!
 //! This runs on every `report_edit`, which in a swarm is the most frequent
-//! call in the system. It is a line-for-line port of the Python engine in
-//! `collide/parser/__init__.py`: same declaration walk, same typed-edge
-//! extraction, same signatures and hashes. A differential test feeds both
-//! the same corpus and asserts the outputs are identical, so "faster" never
-//! quietly means "different".
+//! call in the system: one declaration walk per language table entry, typed
+//! edges, signatures and content hashes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -93,7 +90,7 @@ pub struct Import {
 pub struct ParseOutput {
     pub status: &'static str,
     pub language: &'static str,
-    /// declaration order preserved, exactly as the Python dict would hold it
+    /// declaration order preserved
     pub symbols: Vec<Symbol>,
     pub imports: Vec<Import>,
     /// The module's own documentation: Python's module docstring, or a
@@ -127,12 +124,12 @@ fn symbol_hash(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Python's `" ".join(s.split())`.
+/// Whitespace runs collapsed to single spaces, ends trimmed.
 fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Python's `s[:limit]` — characters, not bytes.
+/// The first `limit` characters — characters, not bytes.
 fn take_chars(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit { text.to_string() } else { text.chars().take(limit).collect() }
 }
@@ -842,8 +839,7 @@ fn edges_in(
         }
     };
 
-    // py-tree-sitter hands out a fresh node per access, so the Python side
-    // matches the heritage child by span; do the same here for parity.
+    // the heritage child is matched by span, not node identity
     let heritage = spec
         .heritage_field
         .and_then(|field| node.child_by_field_name(field))
@@ -981,8 +977,7 @@ fn end_row(node: Node) -> usize {
 
 /// The first paragraph of a declaration's own documentation: the docstring
 /// in Python, the comment block sitting directly above the declaration in
-/// every other language. Whitespace-collapsed and capped at 400 chars. Kept
-/// byte-identical with the Python fallback parser.
+/// every other language. Whitespace-collapsed and capped at 400 chars.
 fn doc_of(node: Node, src: &[u8], spec: &LangSpec) -> String {
     if spec.name == "python" {
         return unwrap(node, spec)
@@ -1194,7 +1189,7 @@ pub fn parse(path: &str, content: &str) -> Option<ParseOutput> {
             sites,
             doc: doc_of(node, src, spec),
         };
-        // a duplicate declaration overwrites, exactly as the Python dict does
+        // a duplicate declaration overwrites the earlier one in place
         match seen.get(&name) {
             Some(&idx) => symbols[idx] = symbol,
             None => {
@@ -1206,4 +1201,148 @@ pub fn parse(path: &str, content: &str) -> Option<ParseOutput> {
 
     let doc = module_doc_of(root, src, spec);
     Some(ParseOutput { status: "clean", language: spec.name, symbols, imports, doc })
+}
+
+#[cfg(test)]
+mod parse_ported_tests {
+    use super::*;
+
+    const CLEAN_PY: &str = "import os\n\ndef greet(name: str) -> str:\n    return f\"hi {name}\"\n\n@staticmethod\ndef decorated_fn(x):\n    return x\n\nclass Widget:\n    def method(self):\n        pass\n";
+    const BROKEN_PY: &str = "def greet(name: str) -> str\n    return f\"hi {name\"\n\ndef half_typed(\n";
+
+    fn names(out: &ParseOutput) -> Vec<&str> {
+        let mut names: Vec<&str> = out.symbols.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    fn symbol<'a>(out: &'a ParseOutput, name: &str) -> &'a Symbol {
+        out.symbols.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("no symbol {name}"))
+    }
+
+    #[test]
+    fn a_clean_parse_extracts_top_level_symbols_only() {
+        let out = parse("a.py", CLEAN_PY).expect("python is supported");
+        assert_eq!(out.status, "clean");
+        assert_eq!(out.language, "python");
+        assert_eq!(names(&out), vec!["Widget", "decorated_fn", "greet"]);
+        assert_eq!(symbol(&out, "greet").kind, "function");
+        assert_eq!(symbol(&out, "Widget").kind, "class");
+        assert!(symbol(&out, "greet").signature.contains("def greet(name: str) -> str"));
+    }
+
+    #[test]
+    fn a_broken_parse_is_partial_with_no_symbols() {
+        let out = parse("a.py", BROKEN_PY).expect("python is supported");
+        assert_eq!(out.status, "partial");
+        assert!(out.symbols.is_empty());
+        let ts = parse("broken.ts", "export function f( {\n").expect("typescript is supported");
+        assert_eq!(ts.status, "partial");
+    }
+
+    #[test]
+    fn an_unsupported_extension_is_not_parsed() {
+        assert!(parse("notes.txt", "hello").is_none());
+        assert_eq!(parse("x.ts", "export const a = 1\n").unwrap().language, "typescript");
+    }
+
+    #[test]
+    fn a_symbol_hash_survives_a_move_and_an_unrelated_reformat() {
+        let a = parse("a.py", "def f():\n    return 1\n\ndef g():\n    return 2\n").unwrap();
+        let b = parse("a.py", "def g():\n    return 2\n\n\n\ndef f():\n    return 1\n").unwrap();
+        assert_eq!(symbol(&a, "f").hash, symbol(&b, "f").hash);
+        assert_eq!(symbol(&a, "g").hash, symbol(&b, "g").hash);
+    }
+
+    #[test]
+    fn a_symbol_hash_moves_with_its_body_or_decorator() {
+        let a = parse("a.py", "def f():\n    return 1\n").unwrap();
+        let b = parse("a.py", "def f():\n    return 2\n").unwrap();
+        assert_ne!(symbol(&a, "f").hash, symbol(&b, "f").hash);
+        let c = parse("a.py", "@cached\ndef f():\n    return 1\n").unwrap();
+        assert_ne!(symbol(&c, "f").hash, symbol(&a, "f").hash);
+        assert_eq!(symbol(&c, "f").name, "f");
+    }
+
+    #[test]
+    fn typescript_declarations_carry_their_kinds() {
+        let src = "export function fetchUser(id: string): Promise<User> { return get(id) }\nexport class Store { }\ninterface User { id: string }\ntype Alias = string\nexport const helper = (x: number) => x * 2\n";
+        let out = parse("a.ts", src).unwrap();
+        assert_eq!(out.status, "clean");
+        assert_eq!(names(&out), vec!["Alias", "Store", "User", "fetchUser", "helper"]);
+        assert_eq!(symbol(&out, "fetchUser").kind, "function");
+        assert_eq!(symbol(&out, "User").kind, "interface");
+        assert_eq!(symbol(&out, "helper").kind, "variable");
+    }
+
+    #[test]
+    fn refs_name_same_file_and_imported_callees() {
+        let caller = "from billing import compute_tax\n\ndef helper(x):\n    return x * 2\n\ndef invoice_total(items):\n    return helper(sum(items)) + compute_tax(items)\n";
+        let out = parse("app.py", caller).unwrap();
+        let refs: Vec<&str> = symbol(&out, "invoice_total").refs.iter().map(String::as_str).collect();
+        assert_eq!(refs, vec!["compute_tax", "helper"]);
+        assert!(symbol(&out, "helper").refs.is_empty());
+        let ts = parse("app.ts", "import { fee } from './fees'\nexport function total(x: number) { return fee(x) + 1 }\n").unwrap();
+        assert!(symbol(&ts, "total").refs.iter().any(|r| r == "fee"));
+    }
+
+    #[test]
+    fn every_edge_is_typed_by_how_the_name_is_used() {
+        let app = "from .billing import compute_tax, Ledger\n\n\ndef invoice_total(items):\n    return sum(items) + compute_tax(items)\n\n\nclass AuditLedger(Ledger):\n    def post(self, amount):\n        return invoice_total([amount])\n";
+        let out = parse("app.py", app).unwrap();
+        let has = |name: &str, edge: (&str, &str, &str)| {
+            symbol(&out, name).edges.iter().any(|(t, m, k)| (t.as_str(), m.as_str(), k.as_str()) == edge)
+        };
+        assert!(has("invoice_total", ("compute_tax", "", "calls")));
+        assert!(has("AuditLedger", ("Ledger", "", "inherits")));
+        assert!(has("AuditLedger", ("invoice_total", "", "calls")));
+        // refs stay the flat name list
+        assert_eq!(symbol(&out, "invoice_total").refs, vec!["compute_tax".to_string()]);
+        // a member access through a namespace keeps the member name
+        let ns = parse("m.py", "import os.path as osp\n\ndef f():\n    return osp.join('a')\n").unwrap();
+        assert!(symbol(&ns, "f").edges.iter().any(|(t, m, k)| t == "osp" && m == "join" && k == "calls"));
+        assert_eq!(ns.imports[0].module, "os.path");
+        assert_eq!(ns.imports[0].names, vec![("osp".to_string(), "*".to_string())]);
+    }
+
+    #[test]
+    fn each_language_names_its_declarations_kind() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("a.go", "package a\nimport \"fmt\"\nfunc F() { fmt.Println() }\n", "F", "function"),
+            ("a.rs", "use crate::b::g;\npub fn f() { g(); }\n", "f", "function"),
+            ("A.java", "package p;\nimport com.x.Y;\nclass A { int m() { return Y.g(); } }\n", "A", "class"),
+            ("a.js", "import { g } from \"./m\";\nexport function f() { return g(); }\n", "f", "function"),
+            ("A.cs", "using X;\nclass A { public int M() { return 1; } }\n", "A", "class"),
+            ("a.rb", "require \"json\"\ndef top(x)\n  x\nend\n", "top", "function"),
+            ("a.c", "#include \"u.h\"\nint f(int a) { return a; }\n", "f", "function"),
+            ("a.cpp", "struct S {};\nint g() { return 1; }\n", "g", "function"),
+            ("a.php", "<?php\nfunction f(int $a) { return $a; }\n", "f", "function"),
+        ];
+        for (path, src, name, kind) in cases {
+            let out = parse(path, src).unwrap_or_else(|| panic!("{path} is supported"));
+            assert_eq!(out.status, "clean", "{path}");
+            assert_eq!(symbol(&out, name).kind, *kind, "{path}");
+        }
+    }
+
+    #[test]
+    fn every_supported_language_parses_a_typical_file_cleanly() {
+        let samples: &[(&str, &str, &str)] = &[
+            ("a.go", "package a\ntype S struct{ X int }\nfunc F(a int) int { return a }\n", "F"),
+            ("a.rs", "pub struct S { x: i32 }\npub fn f(x: i32) -> i32 { x }\n", "f"),
+            ("A.java", "package p;\npublic class A { public int m(int a) { return a; } }\n", "A"),
+            ("A.cs", "namespace N {\n  public class A { public int M(int a) { return a; } }\n}\n", "A"),
+            ("a.rb", "class A\n  def m(a)\n    a\n  end\nend\ndef top(x)\n  x\nend\n", "top"),
+            ("a.c", "static int f(int a) { return a; }\nint main(void) { return f(1); }\n", "main"),
+            ("a.cpp", "class A { public: int m(int a); };\ntemplate <typename T> T id(T t) { return t; }\n", "A"),
+            ("a.php", "<?php\nfunction f(int $a) { return $a; }\nclass A {}\n", "f"),
+            ("a.js", "export function f(a) { return a; }\nclass K { m() {} }\n", "f"),
+            ("a.tsx", "export function Widget() { return 1; }\n", "Widget"),
+        ];
+        for (path, src, expected) in samples {
+            let out = parse(path, src).unwrap_or_else(|| panic!("{path} is supported"));
+            assert_eq!(out.status, "clean", "{path}");
+            assert!(out.symbols.iter().any(|s| s.name == *expected), "{path}: {:?}", names(&out));
+        }
+    }
 }

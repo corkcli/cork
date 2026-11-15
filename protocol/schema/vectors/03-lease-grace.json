@@ -1,0 +1,262 @@
+{
+  "name": "A lease lives with the connection, survives a reconnect, expires after grace",
+  "description": "No heartbeat: the lease holds while Alice is connected and for grace_ms after she drops. She resumes inside the grace and keeps it; when she drops for good it is released and the waiter is told.",
+  "config": {
+    "grace_ms": 5000
+  },
+  "steps": [
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "alice-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "bob-1",
+        "agent_id": "codex-b",
+        "person": "bob@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "bob-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "lease",
+        "req": "L1",
+        "keys": [
+          "code:src/cli.py::parse_config"
+        ],
+        "kinds": [
+          "modify_body"
+        ],
+        "intent": {
+          "id": "i-7",
+          "text": "tighten validation"
+        }
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "lease_granted",
+            "req": "L1",
+            "keys": [
+              "code:src/cli.py::parse_config"
+            ],
+            "kinds": [
+              "modify_body"
+            ],
+            "heads": [
+              {
+                "version": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 1,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "modify_body",
+        "hlc": {
+          "w": 1,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "reject",
+            "reason": "leased",
+            "holder": {
+              "session": "alice-1",
+              "agent_id": "claude-a"
+            },
+            "their_intent": {
+              "text": "tighten validation"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "at": 100,
+      "conn": "alice",
+      "disconnect": true,
+      "expect": []
+    },
+    {
+      "at": 200,
+      "conn": "bob",
+      "send": {
+        "t": "lease",
+        "req": "L2",
+        "keys": [
+          "code:src/cli.py::parse_config"
+        ],
+        "kinds": [
+          "modify_body"
+        ]
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "lease_denied",
+            "req": "L2",
+            "holder": {
+              "session": "alice-1"
+            },
+            "conflicts": [
+              {
+                "key": "code:src/cli.py::parse_config",
+                "kinds": [
+                  "modify_body"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 3000,
+      "conn": "alice",
+      "connect": true,
+      "expect": []
+    },
+    {
+      "at": 3000,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api",
+        "resume": true
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "resumed": true,
+            "resumed_leases": [
+              {
+                "key": "code:src/cli.py::parse_config",
+                "kinds": [
+                  "modify_body"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 4000,
+      "conn": "alice",
+      "disconnect": true,
+      "expect": []
+    },
+    {
+      "at": 8999,
+      "tick": true,
+      "expect": []
+    },
+    {
+      "at": 9000,
+      "tick": true,
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "lease_released",
+            "keys": [
+              "code:src/cli.py::parse_config"
+            ],
+            "reason": "expired",
+            "holder": {
+              "session": "alice-1"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "at": 9001,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.2",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "modify_body",
+        "hlc": {
+          "w": 9001,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "ack",
+            "version": 1
+          }
+        }
+      ]
+    }
+  ]
+}

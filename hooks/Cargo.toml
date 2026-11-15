@@ -1,16 +1,16 @@
 [package]
-name = "collide-hooks"
+name = "cork-hooks"
 version = "0.1.0"
 edition = "2021"
-description = "Collide's agent hooks as one native binary: the gate, the reporter, the watcher"
+description = "Cork's agent hooks as one native binary: the gate, the reporter, the watcher"
 license = "MIT"
 
 [lib]
-name = "collide_hooks"
+name = "cork_hooks"
 path = "src/lib.rs"
 
 [[bin]]
-name = "collide-hook"
+name = "cork-hook"
 path = "src/main.rs"
 
 [dependencies]
@@ -18,7 +18,7 @@ serde_json = "1"
 sha2 = "0.10"
 # the typed-edit applier: tree-sitter lives here, and the source it edits
 # lives on this machine, never on the server
-collide-core = { path = "../core", default-features = false }
+cork-core = { path = "../core", default-features = false }
 regex = "1"
 # the ported patterns use lookahead/lookbehind, which `regex` does not do
 fancy-regex = "0.13"
@@ -26,6 +26,10 @@ ureq = { version = "2", default-features = false, features = ["tls", "json", "gz
 # self-updates are accepted only with CI's Ed25519 signature
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 base64 = "0.22"
+# the real-time protocol: one WebSocket per session (proto.rs), wss through
+# the same rustls ureq already brings
+cork-protocol = { path = "../protocol/core", features = ["ws-client-blocking-tls"] }
+cork-protocol-code = { path = "../protocol/domains/code" }
 
 [profile.release]
 opt-level = 3

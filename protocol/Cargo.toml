@@ -1,0 +1,6 @@
+# The protocol's own workspace. cork-rs and cork-hooks are NOT members:
+# they depend on `core` and `domains/code` by path, which works from outside a
+# workspace as long as no member manifest inherits workspace keys (none do).
+[workspace]
+resolver = "2"
+members = ["core", "domains/code", "domains/notes", "domains/tasks", "server", "conformance"]

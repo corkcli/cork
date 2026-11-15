@@ -64,25 +64,25 @@ fn memory_limit() -> Option<usize> {
 }
 
 fn env_mb(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|mb| mb * MB)
+    crate::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|mb| mb * MB)
 }
 
-/// What the repo caches may hold in all: `COLLIDE_CACHE_BUDGET_MB`, else a
+/// What the repo caches may hold in all: `CORK_CACHE_BUDGET_MB`, else a
 /// quarter of the container's limit up to 6 GB, else 3 GB.
 pub fn budget() -> usize {
     static B: OnceLock<usize> = OnceLock::new();
     *B.get_or_init(|| {
-        env_mb("COLLIDE_CACHE_BUDGET_MB")
+        env_mb("CORK_CACHE_BUDGET_MB")
             .or_else(|| memory_limit().map(|limit| (limit / 4).min(6 * 1024 * MB)))
             .unwrap_or(3 * 1024 * MB)
     })
 }
 
-/// Past this the watchdog sheds: `COLLIDE_MEMORY_SOFT_MB`, else half the
+/// Past this the watchdog sheds: `CORK_MEMORY_SOFT_MB`, else half the
 /// container's limit. `None`: no limit known, no watchdog.
 pub fn soft_limit() -> Option<usize> {
     static S: OnceLock<Option<usize>> = OnceLock::new();
-    *S.get_or_init(|| env_mb("COLLIDE_MEMORY_SOFT_MB").or_else(|| memory_limit().map(|limit| limit / 2)))
+    *S.get_or_init(|| env_mb("CORK_MEMORY_SOFT_MB").or_else(|| memory_limit().map(|limit| limit / 2)))
 }
 
 /// This repo's caches were just used.
@@ -225,14 +225,14 @@ fn alert(resident: usize, soft: usize, after: usize, repos: usize) {
         if !crate::email::configured() {
             return;
         }
-        let to: Vec<String> = std::env::var("COLLIDE_ADMIN_EMAILS")
+        let to: Vec<String> = crate::env::var("CORK_ADMIN_EMAILS")
             .unwrap_or_default()
             .split(',')
             .map(|e| e.trim().to_string())
             .filter(|e| !e.is_empty())
             .collect();
-        let host = std::env::var("COLLIDE_ENGINE_ID").unwrap_or_else(|_| "collide-server".into());
-        let subject = format!("Collide server memory: {} MB, past its {} MB soft limit", resident / MB, soft / MB);
+        let host = crate::env::var("CORK_ENGINE_ID").unwrap_or_else(|_| "collide-server".into());
+        let subject = format!("Cork server memory: {} MB, past its {} MB soft limit", resident / MB, soft / MB);
         let body = format!(
             "{host} reached {} MB of memory (soft limit {} MB). It dropped every cache it can rebuild ({repos} repo map(s)) \
 and is at {} MB now. Agents keep working; briefings for the dropped repos are slower until their maps are rebuilt.\n\n\

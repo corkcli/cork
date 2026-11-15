@@ -1,0 +1,29 @@
+[package]
+name = "cork-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Cork's real-time protocol for agents: versioned keys, typed ops, leases and subscriptions over a dependency graph. Sans-IO core."
+license = "MIT"
+
+[lib]
+name = "cork_protocol"
+path = "src/lib.rs"
+
+[features]
+default = []
+# an async WebSocket server around the Engine (tokio + tokio-tungstenite)
+ws-server = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+# a small blocking WebSocket client for synchronous callers (the hooks)
+ws-client-blocking = ["dep:tungstenite"]
+# wss:// for the blocking client (rustls + webpki roots, no system OpenSSL)
+ws-client-blocking-tls = ["ws-client-blocking", "tungstenite/rustls-tls-webpki-roots"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"], optional = true }
+tokio-tungstenite = { version = "0.24", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+tungstenite = { version = "0.24", optional = true }

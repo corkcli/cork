@@ -1,7 +1,7 @@
 //! Worked examples: a finished, tested task, kept so the next task like it
 //! starts from it.
 //!
-//! Collide already sees a task end to end without git: the prompt (as a
+//! Cork already sees a task end to end without git: the prompt (as a
 //! vector, never its words), every write the session makes, and the test
 //! runs the hook sees in its shell. When a session's tests pass after its
 //! last write, what it added is kept as an example: the functions it added

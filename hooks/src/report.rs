@@ -1,4 +1,4 @@
-//! PostToolUse / Stop: report EVERY file touch to Collide, mechanically.
+//! PostToolUse / Stop: report EVERY file touch to Cork, mechanically.
 //!
 //! Writes post the file's current content to /report, which hashes, diffs and
 //! discards it. Reads post only a path to /presence — no content ever leaves
@@ -20,7 +20,7 @@ use crate::http;
 use crate::shell;
 use crate::transcript;
 
-pub const HOOK_VERSION: u32 = 69; // must match blocks.HOOK_ARTIFACT_VERSION
+pub const HOOK_VERSION: u32 = 114; // must match blocks.HOOK_ARTIFACT_VERSION
 pub const TOTAL_BUDGET: Duration = Duration::from_millis(500);
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 
@@ -28,8 +28,8 @@ pub(crate) const WRITE_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "Notebo
 const READ_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "Bash"];
 const SHELL_TOOLS: [&str; 3] = ["Bash", "shell", "run_terminal_cmd"];
 
-const SENSITIVE_PATH_MARKERS: [&str; 11] = [
-    ".ssh", ".gnupg", ".aws", ".collide", "credential", "secret", ".env", ".pem", ".key",
+const SENSITIVE_PATH_MARKERS: [&str; 12] = [
+    ".ssh", ".gnupg", ".aws", ".cork", ".collide", "credential", "secret", ".env", ".pem", ".key",
     "id_rsa", "token",
 ];
 
@@ -121,8 +121,21 @@ pub(crate) fn machine_id(env: &Env) -> String {
     made
 }
 
+/// The editor the agent works in and its workspace (see ide.rs), beside the
+/// branch: the dashboard's breadcrumb. Only when known, so
+/// an agent in a plain terminal sends what it always sent.
+fn add_ide(meta: &mut serde_json::Map<String, Value>, root: &Path, env: &Env) {
+    let found = crate::ide::of(root, env);
+    if !found.ide.is_empty() {
+        meta.insert("ide".into(), json!(found.ide));
+    }
+    if !found.workspace.is_empty() {
+        meta.insert("ide_workspace".into(), json!(found.workspace));
+    }
+}
+
 pub(crate) fn user_agent() -> String {
-    format!("collide-report-hook/{HOOK_VERSION}")
+    format!("cork-report-hook/{HOOK_VERSION}")
 }
 
 /// Out-of-repo READS are presence too — the path travels, content never does.
@@ -148,7 +161,7 @@ fn block_version_re() -> &'static Regex {
     })
 }
 
-/// The Collide block version this repo's AGENTS.md actually carries; 0 when
+/// The Cork block version this repo's AGENTS.md actually carries; 0 when
 /// there is no block. Sent with every edit so the server can compare ground
 /// truth against the version it ships.
 fn agents_block_version(root: &Path) -> u32 {
@@ -167,7 +180,7 @@ fn agents_block_version(root: &Path) -> u32 {
 }
 
 /// Cross-agent awareness, pushed INTO the session: teammates' certain
-/// interface changes since this agent last talked to Collide, so it adapts
+/// interface changes since this agent last talked to Cork, so it adapts
 /// within one tool call of a teammate's save.
 /// The server asked for one line of rationale: the symbol just written is
 /// hot (other agents on the file) and the write carried no reason. Mirrors
@@ -202,9 +215,38 @@ fn ask_why_note(response: &Value) -> String {
     let symbol = text(ask, "symbol");
     let where_ = if symbol.is_empty() { path.clone() } else { format!("{path}::{symbol}") };
     let others = ask.get("others").and_then(Value::as_i64).unwrap_or(0);
+    // no tool to call for it: a tool's schema load and call cost two messages
     format!(
-        "Collide: {where_} is hot ({others} other agent(s) on this file). One line, why this change? \
-Say it to the user and record it: report_edit(repo_id, \"{path}\", why=\"...\")."
+        "Cork: {where_} is hot ({others} other agent(s) on this file). Say in one line, to the user and in your \
+commit message, why you changed it."
+    )
+}
+
+/// The write changed a function other files call (the server's
+/// `dependents`): once per session per symbol, how to tell only the agents
+/// working on those callers. The only time the message command is offered
+/// unasked: at session start it made every agent announce its plan.
+fn dependents_note(response: &Value, session: &str, env: &Env) -> String {
+    let Some(hint) = response.get("dependents").filter(|d| d.is_object()) else { return String::new() };
+    let path = text(hint, "path");
+    let symbols: Vec<String> = hint.get("symbols").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(Value::as_str).map(str::to_string).collect();
+    let Some(symbol) = symbols.first() else { return String::new() };
+    if path.is_empty() || session.is_empty() {
+        return String::new();
+    }
+    let mut told = crate::deps::Told::load(env, session);
+    let fact = format!("tell|{path}::{symbol}");
+    if told.knows(&fact) {
+        return String::new();
+    }
+    told.note(&fact, "", false);
+    told.save();
+    let files = hint.get("files").and_then(Value::as_u64).unwrap_or(0);
+    format!(
+        "Cork: other code calls `{symbol}` ({files} file(s)). If its callers need to know, \
+`{} --about {path}::{symbol} \"...\"` reaches only the agents working on them.",
+        crate::machine::message_command(env)
     )
 }
 
@@ -282,7 +324,7 @@ fn awareness_context(response: &Value) -> String {
         return String::new();
     }
     format!(
-        "Collide: teammates changed code you may depend on since your last sync. Adapt to the \
+        "Cork: teammates changed code you may depend on since your last sync. Adapt to the \
 NEW names/signatures before writing against the old ones (verify with \
 check_collisions/get_symbol if unsure), and say so to the user:\n{}",
         lines.join("\n")
@@ -301,8 +343,7 @@ fn settings_file(harness: &str) -> &'static str {
     }
 }
 
-/// A shell command that runs one of Collide's hooks, in any dialect. Exact
-/// twin of `blocks.py::_is_collide_command`.
+/// A shell command that runs one of Cork's hooks, in any dialect.
 fn is_collide_command(text: &str) -> bool {
     text.contains("collide")
         && (text.contains(".collide/report_hook.py")
@@ -313,10 +354,10 @@ fn is_collide_command(text: &str) -> bool {
             || text.contains("collide-gate-hook"))
 }
 
-/// Every Collide command, tagged with the event it is wired under — the
+/// Every Cork command, tagged with the event it is wired under — the
 /// nearest enclosing key that is not the dialect's own "hooks"/"command"
 /// plumbing — so wiring the same script to one more event changes the
-/// digest. Exact twin of `blocks::walk_commands`.
+/// digest.
 fn walk_commands(node: &Value, event: &str, found: &mut std::collections::BTreeSet<String>) {
     match node {
         Value::Object(map) => {
@@ -337,7 +378,7 @@ fn walk_commands(node: &Value, event: &str, found: &mut std::collections::BTreeS
     }
 }
 
-/// Fingerprint of the Collide hooks this repo's settings file installs, or
+/// Fingerprint of the Cork hooks this repo's settings file installs, or
 /// empty when there is no such file or it installs none of ours.
 ///
 /// The SCRIPTS carry a version of their own. The settings block does not,
@@ -365,7 +406,8 @@ fn settings_digest(root: &Path) -> String {
 /// The staleness notice, said once rather than on every single edit.
 ///
 /// It used to ride every response unfiltered, so a repo that could not fix
-/// itself (the shadowing binary, before `supersede`) repeated it forever.
+/// itself (a stale binary shadowing a newer committed script) repeated it
+/// forever.
 /// The stamp carries this hook's own version too, so a LATER version that is
 /// still behind gets to speak again instead of inheriting the old silence.
 fn artifacts_note(response: &Value, root: &Path, server: &str, env: &Env) -> String {
@@ -408,10 +450,27 @@ fn setup_note(response: &Value, root: &Path) -> String {
     }
     let _ = std::fs::write(&stamp, json!({"notified": hint, "ts": 0}).to_string());
     format!(
-        "Collide: {hint} Act on this unprompted at your next clean moment: call the collide tool \
-setup, apply its agents_md_block with sync_agents_block, and commit the result — until then \
-the whole team is following an out-of-date protocol."
+        "Cork: {hint} Act on this unprompted at your next clean moment: call the cork tool \
+sync_agents_block with this repo's AGENTS.md, write back what it returns, and commit the result \
+— until then the whole team is following an out-of-date protocol."
     )
+}
+
+/// This repo still carries Cork's old per-repo hooks, which the machine
+/// install replaced. Its own key, not `artifacts_outdated`: a managed binary
+/// answers that one by updating itself and saying nothing, and no update
+/// can take a repo's committed files out. Repeats only when it changes.
+fn retired_note(response: &Value, root: &Path) -> String {
+    let notice = text(response, "repo_hooks_retired");
+    if notice.is_empty() {
+        return String::new();
+    }
+    let stamp = git::stamp_path(root, "retired");
+    if config::load_json(&stamp).get("notified").and_then(Value::as_str) == Some(notice.as_str()) {
+        return String::new();
+    }
+    let _ = std::fs::write(&stamp, json!({"notified": notice, "ts": 0}).to_string());
+    notice
 }
 
 /// Where a teammate's new name is, as this checkout sees it: in the working
@@ -429,8 +488,77 @@ fn name_state(root: &Path, name: &str) -> &'static str {
     }
 }
 
+/// The response without the lint findings this file does not bear out: a
+/// rename or removal whose old name it no longer uses, a new signature
+/// every call of which already fits (`fixlines::lines_for`, read here from
+/// the file as written). Lattice test, round 2 (v104): five "signature
+/// changed" findings for 14-hour-old parameter renames, every call already
+/// matching, cost each session a verification step.
+fn biting(response: &Value, content: &str) -> Value {
+    let mut out = response.clone();
+    if let Some(findings) = out.get_mut("findings").and_then(Value::as_array_mut) {
+        findings.retain(|f| {
+            if !matches!(text(f, "rule").as_str(), "signature_drift" | "stale_name" | "removed_symbol_use") {
+                return true;
+            }
+            crate::fixlines::from_finding(f)
+                .is_some_and(|fix| !crate::fixlines::lines_for(content, &Default::default(), &fix).is_empty())
+        });
+    }
+    out
+}
+
+/// The response without the lint findings this session was already told
+/// about (`told`: `(bare symbol, sig|ren|del)` from deps.rs's Told).
+fn strip_told(response: &Value, told: &std::collections::BTreeSet<(String, String)>) -> Value {
+    if told.is_empty() {
+        return response.clone();
+    }
+    let mut out = response.clone();
+    if let Some(findings) = out.get_mut("findings").and_then(Value::as_array_mut) {
+        findings.retain(|f| {
+            let kind = match text(f, "rule").as_str() {
+                "signature_drift" => "sig",
+                "stale_name" => "ren",
+                "removed_symbol_use" => "del",
+                _ => return true,
+            };
+            let symbol = text(f, "symbol");
+            let bare = symbol.rsplit('.').next().unwrap_or(&symbol).to_string();
+            !told.contains(&(bare, kind.to_string()))
+        });
+    }
+    out
+}
+
+/// The lint findings this session has not yet heard for `rel`, marked
+/// heard: the same finding came back on every edit of a file before (and
+/// at 16 agents each one was read again and again).
+fn once_per_session(response: &Value, rel: &str, root: &Path, told: &mut crate::deps::Told) -> Value {
+    let mut out = response.clone();
+    let mut said = false;
+    if let Some(findings) = out.get_mut("findings").and_then(Value::as_array_mut) {
+        findings.retain(|f| {
+            // a rename that reached this checkout since is news again: now
+            // the mechanical fix applies
+            let state = if text(f, "rule") == "stale_name" { name_state(root, &text(f, "renamed_to")) } else { "" };
+            let fact = format!("lint:{}|{}|{}|{state}", text(f, "rule"), text(f, "symbol"), text(f, "renamed_to"));
+            if told.knows_file(&fact, rel) {
+                return false;
+            }
+            told.note(&fact, rel, false);
+            said = true;
+            true
+        });
+    }
+    if said {
+        told.save();
+    }
+    out
+}
+
 /// Findings from the semantic linter, phrased for the agent's context.
-fn lint_context(response: &Value, skip_mechanical: bool, root: &Path) -> String {
+pub(crate) fn lint_context(response: &Value, skip_mechanical: bool, root: &Path, lands: bool) -> String {
     let findings = response.get("findings").and_then(Value::as_array).cloned().unwrap_or_default();
     if findings.is_empty() {
         return String::new();
@@ -439,7 +567,7 @@ fn lint_context(response: &Value, skip_mechanical: bool, root: &Path) -> String 
         let m = text(response, "autofix_mode");
         if m.is_empty() { "findings".to_string() } else { m }
     };
-    let mut lines = vec!["Collide lint — teammates' in-flight changes affect this file:".to_string()];
+    let mut lines = vec!["Cork lint — teammates' in-flight changes affect this file:".to_string()];
     let mut judgment_present = false;
     for finding in findings.iter().take(5) {
         let fix = finding.get("fix").cloned().unwrap_or(Value::Null);
@@ -453,25 +581,35 @@ fn lint_context(response: &Value, skip_mechanical: bool, root: &Path) -> String 
                 other => other.to_string(),
             })
             .unwrap_or_else(|| "None".into());
-        if text(finding, "rule") == "stale_name" {
+        // a rename reached through an alias or a module path is the
+        // import's to fix: it reads as a judgment finding, with its prompt
+        if text(finding, "rule") == "stale_name" && text(&fix, "class") != "judgment" {
             let by = {
                 let b = text(finding, "by");
                 if b.is_empty() { "a teammate".to_string() } else { b }
             };
             let (old, new) = (text(finding, "symbol"), text(finding, "renamed_to"));
+            // which file's symbol (v80): a bare name could be anyone's
+            let at = {
+                let defined_in = text(finding, "in");
+                if defined_in.is_empty() { String::new() } else { format!(" in {defined_in}") }
+            };
             lines.push(match name_state(root, &new) {
                 "here" => format!(
-                    "- `{old}` was renamed to `{new}` by {by}; this file still uses the old name (lines {lines_at}). \
+                    "- `{old}`{at} was renamed to `{new}` by {by}; this file still uses the old name (lines {lines_at}). \
 Mechanical fix: replace the identifier."
                 ),
+                "origin" if lands => format!(
+                    "- `{old}`{at} was renamed to `{new}` by {by}; it is on origin but not in your checkout (lines {lines_at} use \
+the old name): write against `{new}`; landing will rebase onto their change."
+                ),
                 "origin" => format!(
-                    "- `{old}` was renamed to `{new}` by {by}; it is on origin but not in your checkout (lines {lines_at} use \
+                    "- `{old}`{at} was renamed to `{new}` by {by}; it is on origin but not in your checkout (lines {lines_at} use \
 the old name). Pull or rebase onto it first, then replace the identifier."
                 ),
                 _ => format!(
-                    "- `{old}` was renamed to `{new}` by {by}, not on origin yet (lines {lines_at} use the old name). Keep the \
-old name until it lands: your checkout does not have the new one, so switching now breaks your tests. Once you pull or \
-rebase onto it, replace the identifier."
+                    "- `{old}`{at} was renamed to `{new}` by {by}, not pushed yet (lines {lines_at} use the old name): write \
+against `{new}`; landing will rebase onto their change."
                 ),
             });
         } else {
@@ -481,7 +619,7 @@ rebase onto it, replace the identifier."
                 text(finding, "rule"),
                 text(finding, "symbol"),
                 lines_at,
-                take_chars(&text(&fix, "prompt"), 220)
+                take_chars(&text(&fix, "prompt"), 300)
             ));
         }
     }
@@ -571,7 +709,7 @@ fn apply_mechanical(
         budget,
     );
     format!(
-        "Collide AUTOFIX rewrote {rel} on disk ({}) — the file changed since your last read; \
+        "Cork AUTOFIX rewrote {rel} on disk ({}) — the file changed since your last read; \
 re-read it before editing again.",
         applied.join("; ")
     )
@@ -590,7 +728,7 @@ fn adopt_preferred_repo_id(response: &Value, root: &Path, current_repo_id: &str)
     if origin.is_empty() || origin != git::normalize_repo_url(&preferred) {
         return String::new(); // can't confirm this checkout is the renamed repo
     }
-    let cfg_path = root.join(".collide").join("config.json");
+    let cfg_path = config::repo_config_path(root);
     let mut cfg = config::load_json(&cfg_path);
     if cfg.get("repo_id").and_then(Value::as_str) == Some(preferred.as_str()) {
         return String::new();
@@ -602,8 +740,9 @@ fn adopt_preferred_repo_id(response: &Value, root: &Path, current_repo_id: &str)
         return String::new();
     }
     format!(
-        "Collide: this repo was renamed to {preferred} — updated .collide/config.json to match. \
-Commit it so teammates follow."
+        "Cork: this repo was renamed to {preferred} — updated {} to match. \
+Commit it so teammates follow.",
+        cfg_path.strip_prefix(root).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_else(|_| ".cork/config.json".into())
     )
 }
 
@@ -612,11 +751,41 @@ Commit it so teammates follow."
 /// no context channel we rely on, and whatever is pending waits for the next.
 static FAILED_CALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The session whose protocol spool this event drains (proto.rs).
+static NOTICES_FOR: std::sync::Mutex<Option<(Env, String)>> = std::sync::Mutex::new(None);
+
+/// The session whose listener's held-back messages this event prints (peer.rs).
+static HELD_FOR: std::sync::Mutex<Option<(Env, String)>> = std::sync::Mutex::new(None);
+
+/// The first-touch briefing this call earned (touch.rs), said with
+/// whatever else the call has to say.
+static FIRST_TOUCH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The line about this folder's branch moving under the session (switches.rs).
+static SWITCHED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 fn emit(note: &str) -> i32 {
     if FAILED_CALL.load(std::sync::atomic::Ordering::Relaxed) {
         return 0;
     }
-    let note = crate::check::with_pending(note);
+    let first = FIRST_TOUCH.lock().map(|mut slot| std::mem::take(&mut *slot)).unwrap_or_default();
+    let switched = SWITCHED.lock().map(|mut slot| std::mem::take(&mut *slot)).unwrap_or_default();
+    let note = crate::prompt::join_notes(&[&switched, &first, note]);
+    let note = note.as_str();
+    // teammates' live changes and refused ops, queued by the session's daemon
+    let live = NOTICES_FOR
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|(env, session)| crate::proto::take_notices(env, session)))
+        .unwrap_or_default();
+    // messages the session's listener could not post without their being held
+    let held = HELD_FOR
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|(env, session)| crate::peer::take_held(session, env)))
+        .unwrap_or_default();
+    let note = crate::prompt::join_notes(&[&held, &live, note]);
+    let note = crate::check::with_pending(&note);
     // the context lands in the agent's session: awareness arrives with the
     // write, not at the next voluntary check. A harness that reads nothing
     // back queues it for the next turn instead.
@@ -628,10 +797,10 @@ fn emit(note: &str) -> i32 {
 }
 
 /// Stop hook: the turn ended. If it ended because the agent ran out of quota,
-/// tell Collide so the team sees "hit its limit" on the Now panel instead of a
+/// tell Cork so the team sees "hit its limit" on the Now panel instead of a
 /// teammate that silently went dark mid-task.
 /// ConfigChange: the settings file just changed, and THIS hook firing is
-/// proof Collide's hooks are loaded in this session.
+/// proof Cork's hooks are loaded in this session.
 ///
 /// Until now the setup nag cleared only when a file write was reported, so a
 /// session that installed the hooks and then only read kept being told to
@@ -642,7 +811,7 @@ fn run_config_change(hook_input: &Value, env: &Env) -> i32 {
     let settings = if file_path.is_empty() { Value::Null } else { config::load_json(Path::new(&file_path)) };
     let hooks = settings.get("hooks").cloned().unwrap_or(Value::Null).to_string();
     if !hooks.contains("report_hook.py") && !hooks.contains("collide-hook") && !hooks.contains("collide-report-hook") {
-        return 0; // an unrelated settings edit is not evidence about Collide
+        return 0; // an unrelated settings edit is not evidence about Cork
     }
     let session = text(hook_input, "session_id");
     let state_file = crate::check::state_path(&session, env);
@@ -671,21 +840,54 @@ fn run_config_change(hook_input: &Value, env: &Env) -> i32 {
     0
 }
 
+/// The limit a turn that ended on an API error ran into (Claude Code's
+/// StopFailure, which fires INSTEAD of Stop: a session that hit its limit
+/// never sent a Stop, so the limit never reached Cork). Its
+/// `last_assistant_message` is the harness's notice ("You've hit your
+/// session limit · resets 4:20pm (America/Los_Angeles)"); the transcript's
+/// tail says the same. A rate limit with no words of its own is still one.
+fn stop_failure_note(hook_input: &Value, path: &str) -> String {
+    let said = transcript::limit_from_text(&text(hook_input, "last_assistant_message"));
+    if !said.is_empty() {
+        return said;
+    }
+    let tail = transcript::limit_note(path);
+    if !tail.is_empty() {
+        return tail;
+    }
+    match text(hook_input, "error").as_str() {
+        "rate_limit" => "usage limit reached".to_string(),
+        "billing_error" => "billing limit reached".to_string(),
+        _ => String::new(),
+    }
+}
+
 fn run_stop(hook_input: &Value, env: &Env, started: Instant) -> i32 {
+    // a long turn finishing: the person may have walked away from it
+    let ran = crate::pings::turn_ended(&text(hook_input, "session_id"), env);
+    if ran >= crate::pings::LONG_RUN_S {
+        crate::pings::ping(env, crate::pings::Kind::LongRun, &PathBuf::from(text(hook_input, "cwd")), "Cork: an agent finished",
+            &format!("After {} of work, its turn is done.", crate::pings::duration_words(ran)));
+    }
     // the turn's last message replayed the context too; then the briefing's
     // tally for the turn, then the limit note
-    crate::prompt::note_call(&text(hook_input, "session_id"), env);
-    crate::prompt::brief_outcome(hook_input, env, started, false);
     let path = text(hook_input, "transcript_path");
-    let note = transcript::limit_note(&path);
+    let failed = text(hook_input, "hook_event_name") == "StopFailure";
+    let message = transcript::turn_meta(&path).get("turn_id").and_then(Value::as_str).unwrap_or("").to_string();
+    crate::prompt::note_call(&text(hook_input, "session_id"), !text(hook_input, "agent_id").is_empty(), &message, env);
+    if !failed {
+        crate::prompt::brief_outcome(hook_input, env, started, false);
+    }
+    let note = if failed { stop_failure_note(hook_input, &path) } else { transcript::limit_note(&path) };
     // what the agent said it did: the note on the code this turn changed
-    let reply = {
+    // (a turn that ended on an API error said nothing: the harness's error
+    // text is not the agent's closing words)
+    let reply = if failed {
+        String::new()
+    } else {
         let given = text(hook_input, "last_assistant_message");
         if given.trim().is_empty() { transcript::last_reply(&path) } else { given }
     };
-    if note.is_empty() && reply.trim().is_empty() {
-        return 0;
-    }
     let cwd = {
         let from_input = text(hook_input, "cwd");
         if from_input.is_empty() {
@@ -706,21 +908,60 @@ fn run_stop(hook_input: &Value, env: &Env, started: Instant) -> i32 {
     if !cfg.usable() {
         return 0;
     }
+    // whatever this hook cannot deliver in its budget, and every subagent's
+    // messages its own SubagentStop did not see, go with a detached sender
+    let _later = BillLater::new(&root, &path, &text(hook_input, "session_id"), env);
+    // every message since the last bill, the ones that ended in a read, a
+    // command or plain text included: the turn's whole cost
+    let usage = transcript::take_unbilled(&path, env);
+    if note.is_empty() && reply.trim().is_empty() && usage.is_empty() {
+        return 0;
+    }
     let remaining = TOTAL_BUDGET.checked_sub(started.elapsed()).unwrap_or_default();
     if remaining.is_zero() {
-        return 0;
+        return 0; // what it spent is owed, and goes with the next bill
     }
     let session = text(hook_input, "session_id");
+    let title = transcript::title(&path, env);
     if note.is_empty() {
-        // no tokens ride this one: the turn's cost went with its edits
-        let settled = json!({"repo_id": cfg.repo_id, "session": session, "action": "settled",
-                             "text": reply, "agent": user_agent()});
-        let _ = http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &settled, remaining);
+        let mut settled = json!({"repo_id": cfg.repo_id, "session": session, "agent": user_agent()});
+        if reply.trim().is_empty() {
+            settled["action"] = json!("usage");
+        } else {
+            settled["action"] = json!("settled");
+            settled["text"] = json!(reply);
+        }
+        if !usage.is_empty() {
+            settled["usage"] = json!(usage);
+        }
+        if !title.is_empty() {
+            settled["title"] = json!(title);
+        }
+        let cc_name = transcript::session_name(&session, false, env);
+        if !cc_name.is_empty() {
+            settled["cc_name"] = json!(cc_name);
+        }
+        settled["harness"] = json!(crate::harness::current());
+        // a turn a posted message started may have made no tool call
+        let peer_seen = transcript::peer_seen(&session, &path, env);
+        if !peer_seen.is_empty() {
+            settled["peer_seen"] = json!(peer_seen);
+        }
+        if bill_landed(&http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &settled, remaining)) && !usage.is_empty() {
+            transcript::billed(&path, &usage, env);
+        }
         return 0;
     }
-    let mut meta = transcript::turn_meta(&path);
+    let mut meta = transcript::turn_meta_in(&path, env);
     for key in transcript::USAGE_KEYS {
-        meta.remove(key); // a limit hit spends nothing
+        meta.remove(key); // the limit row itself spends nothing: the bill rides beside it
+    }
+    meta.remove("turn_id");
+    if !usage.is_empty() {
+        meta.insert("usage".into(), json!(usage));
+    }
+    if !title.is_empty() {
+        meta.insert("title".into(), json!(title));
     }
     if !session.is_empty() {
         meta.insert("session".into(), json!(session));
@@ -729,10 +970,11 @@ fn run_stop(hook_input: &Value, env: &Env, started: Instant) -> i32 {
     if !branch.is_empty() {
         meta.insert("branch".into(), json!(branch));
     }
+    add_ide(&mut meta, &root, env);
     meta.insert("repo_id".into(), json!(cfg.repo_id));
     meta.insert("path".into(), json!(note));
     meta.insert("action".into(), json!("limit"));
-    let _ = http::post(
+    let posted = http::post(
         &cfg.server,
         "/presence",
         &cfg.token,
@@ -740,16 +982,212 @@ fn run_stop(hook_input: &Value, env: &Env, started: Instant) -> i32 {
         &Value::Object(meta),
         remaining,
     );
+    if bill_landed(&posted) && !usage.is_empty() {
+        transcript::billed(&path, &usage, env);
+    }
     0
 }
 
+/// SubagentStop: a subagent finished. Its messages live in its own
+/// transcript (`<session>/subagents/agent-<id>.jsonl`), which no Stop of
+/// the session reads: summed here, with a marker of its own, and billed
+/// under the parent session with the worker named. The worker's marker goes
+/// too, so the roster stops counting a subagent that is done.
+fn run_subagent_stop(hook_input: &Value, env: &Env, started: Instant) -> i32 {
+    let worker = text(hook_input, "agent_id");
+    let parent = text(hook_input, "transcript_path");
+    let path = transcript::subagent_transcript(&text(hook_input, "agent_transcript_path"), &parent, &worker);
+    if worker.is_empty() || path.is_empty() {
+        return 0;
+    }
+    let cwd = {
+        let from_input = text(hook_input, "cwd");
+        if from_input.is_empty() { std::env::current_dir().unwrap_or_default() } else { PathBuf::from(from_input) }
+    };
+    let project_dir = config::get(env, "CLAUDE_PROJECT_DIR");
+    let project = (!project_dir.is_empty()).then(|| PathBuf::from(project_dir));
+    let Some(root) = config::find_repo_root(&[Some(cwd), project]) else { return 0 };
+    let cfg = config::config(Some(&root), env);
+    if !cfg.usable() {
+        return 0;
+    }
+    let _later = BillLater::new(&root, &parent, &text(hook_input, "session_id"), env);
+    // what it still owed the server is history now: never sent again, so
+    // its parent's posts cannot draw it live once more (spool.rs)
+    crate::spool::worker_ended(env, &cfg.server, &cfg.repo_id, &worker);
+    // trunk mode: its branch, all committed, lands into the trunk (detached)
+    crate::trunk::on_done(&root, &text(hook_input, "session_id"), &worker, "stop", env);
+    let usage = transcript::take_unbilled(&path, env);
+    let remaining = TOTAL_BUDGET.checked_sub(started.elapsed()).unwrap_or_default();
+    if remaining.is_zero() {
+        return 0;
+    }
+    let mut payload = json!({"repo_id": cfg.repo_id, "session": text(hook_input, "session_id"), "action": "usage",
+                             "agent": user_agent(), "worker": worker, "worker_ended": true});
+    for (field, value) in [("worker_type", text(hook_input, "agent_type")), ("worker_name", transcript::worker_name(&parent, &worker))] {
+        if !value.is_empty() {
+            payload[field] = json!(value);
+        }
+    }
+    if !usage.is_empty() {
+        payload["usage"] = json!(usage);
+    }
+    if bill_landed(&http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &payload, remaining)) && !usage.is_empty() {
+        transcript::billed(&path, &usage, env);
+    }
+    0
+}
+
+/// Whatever a bill still owes when the hook returns: a post that failed or
+/// never fit the hook's budget (a Codex `exec` run has one Stop and no
+/// SessionEnd, so its bill was otherwise never sent), and every subagent
+/// transcript of the session with messages no bill has counted (a
+/// subagent's last message is often written after its SubagentStop read
+/// the file). Handed, on drop, to a detached `collide-hook bill-send`,
+/// which has the time to deliver it.
+struct BillLater {
+    root: PathBuf,
+    transcript: String,
+    session: String,
+    env: Env,
+}
+
+impl BillLater {
+    fn new(root: &Path, transcript: &str, session: &str, env: &Env) -> BillLater {
+        BillLater { root: root.to_path_buf(), transcript: transcript.to_string(), session: session.to_string(), env: env.clone() }
+    }
+}
+
+impl Drop for BillLater {
+    fn drop(&mut self) {
+        if !self.transcript.is_empty() && transcript::anything_unbilled(&self.transcript, &self.env) {
+            // remembered on disk first: a sender that dies, or a machine that
+            // sleeps, leaves the bill for the next hook run to send
+            transcript::note_owing(&self.transcript, &self.root, &self.session, &self.env);
+            spawn_bill_send(&self.root, &self.transcript, &self.session);
+        }
+        // and the bills earlier sessions on this machine still owe (their
+        // sender gave up while the server was out of reach)
+        for (root, path, session) in transcript::owing_elsewhere(&self.transcript, &self.env) {
+            spawn_bill_send(&root, &path, &session);
+        }
+    }
+}
+
+/// A detached `collide-hook bill-send` for one transcript.
+fn spawn_bill_send(root: &Path, transcript: &str, session: &str) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("bill-send")
+        .arg(root)
+        .arg(transcript)
+        .arg(session)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let _ = command.spawn();
+}
+
+/// A bill post landed only when the server says so: a 200 whose answer is
+/// `ok: false` (rate limited, the repo refused, signed out) recorded
+/// nothing, and taking it for delivered is how Study 9's session burst lost
+/// whole sessions' usage.
+fn bill_landed(posted: &Result<Value, ()>) -> bool {
+    matches!(posted, Ok(answer) if answer.get("ok").and_then(Value::as_bool) == Some(true))
+}
+
+/// How long the detached sender waits before it reads: a subagent's last
+/// lines land just after the hook that started it.
+const BILL_SEND_SETTLE: Duration = Duration::from_secs(2);
+/// And how long each of its posts may take.
+const BILL_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+/// The waits between its tries while the server does not take the bill:
+/// about four minutes in all, past a burst of sessions or a redeploy. What
+/// is still owed after that stays on disk for the next hook run to send.
+const BILL_SEND_RETRIES: [Duration; 5] =
+    [Duration::from_secs(3), Duration::from_secs(10), Duration::from_secs(30), Duration::from_secs(60), Duration::from_secs(120)];
+
+/// `collide-hook bill-send <root> <transcript> <session>`, detached: post
+/// what the session's transcript still owes, then bill each of its subagent
+/// transcripts, under the subagent's name, trying again while the server
+/// does not take it. Every entry carries the ids of the messages it sums,
+/// so a post the hook itself also landed is billed once.
+pub fn bill_send_command(args: &[String], env: &Env) -> i32 {
+    let arg = |at: usize| args.get(at).cloned().unwrap_or_default();
+    let (root, path, session) = (PathBuf::from(arg(1)), arg(2), arg(3));
+    if path.is_empty() {
+        return 0;
+    }
+    let cfg = config::config(Some(&root), env);
+    if !cfg.usable() {
+        return 0;
+    }
+    let settle = config::get(env, "CORK_BILL_SETTLE_MS").parse::<u64>().map(Duration::from_millis).unwrap_or(BILL_SEND_SETTLE);
+    std::thread::sleep(settle);
+    let mut waits = BILL_SEND_RETRIES.iter();
+    loop {
+        if send_owed(&cfg, &path, &session, env) {
+            transcript::paid_up(&path, env);
+            return 0;
+        }
+        let Some(wait) = waits.next() else { return 0 };
+        std::thread::sleep(*wait);
+    }
+}
+
+/// One try at everything `path` and its subagents owe; true when nothing is
+/// owed any more.
+fn send_owed(cfg: &config::Config, path: &str, session: &str, env: &Env) -> bool {
+    let base = json!({"repo_id": cfg.repo_id, "session": session, "action": "usage", "agent": user_agent()});
+    let mut clear = true;
+    let owed = transcript::owed(path, env);
+    if !owed.is_empty() {
+        let mut payload = base.clone();
+        payload["usage"] = json!(owed);
+        if bill_landed(&http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &payload, BILL_SEND_TIMEOUT)) {
+            transcript::billed(path, &owed, env);
+        } else {
+            clear = false;
+        }
+    }
+    for (worker, file) in transcript::subagent_transcripts(path) {
+        let usage = transcript::take_unbilled(&file, env);
+        if usage.is_empty() {
+            continue;
+        }
+        let mut payload = base.clone();
+        payload["usage"] = json!(usage);
+        payload["worker"] = json!(worker);
+        let name = transcript::worker_name(path, &worker);
+        if !name.is_empty() {
+            payload["worker_name"] = json!(name);
+        }
+        if bill_landed(&http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &payload, BILL_SEND_TIMEOUT)) {
+            transcript::billed(&file, &usage, env);
+        } else {
+            clear = false;
+        }
+    }
+    clear && !transcript::anything_unbilled(path, env)
+}
+
+/// What a session's end may spend asking git about the files it wrote,
+/// out of `TOTAL_BUDGET`: the post that ends the session must not starve.
+const GIT_STATE_BUDGET: Duration = Duration::from_millis(200);
+
 /// SessionEnd: the conversation is over — Claude Code's exit, /clear or
 /// logout; Codex's close, or 30 idle minutes; Cursor's sessionEnd. Tell
-/// Collide, so the Now panel stops counting this agent the moment it is gone
+/// Cork, so the Now panel stops counting this agent the moment it is gone
 /// instead of an hour later, when silence is finally taken for absence. Fire
-/// and forget: nothing is printed and nothing can block. The turns already
-/// paid for themselves at Stop, so no usage rides along. Then the briefing
-/// tally's last report for the session. Mirrors `_run_session_end`.
+/// and forget: nothing is printed and nothing can block. Whatever the last
+/// Stop did not bill rides along. Then the briefing tally's last report for
+/// the session.
 fn run_session_end(hook_input: &Value, env: &Env, started: Instant) -> i32 {
     let cwd = {
         let from_input = text(hook_input, "cwd");
@@ -771,13 +1209,20 @@ fn run_session_end(hook_input: &Value, env: &Env, started: Instant) -> i32 {
     if !cfg.usable() {
         return 0;
     }
+    let path = text(hook_input, "transcript_path");
+    let _later = BillLater::new(&root, &path, &text(hook_input, "session_id"), env);
     let remaining = TOTAL_BUDGET.checked_sub(started.elapsed()).unwrap_or_default();
     if remaining.is_zero() {
         return 0;
     }
-    let mut meta = transcript::turn_meta(&text(hook_input, "transcript_path"));
+    let mut meta = transcript::turn_meta_in(&path, env);
     for key in transcript::USAGE_KEYS {
         meta.remove(key);
+    }
+    meta.remove("turn_id");
+    let usage = transcript::take_unbilled(&path, env);
+    if !usage.is_empty() {
+        meta.insert("usage".into(), json!(usage));
     }
     let session = text(hook_input, "session_id");
     if !session.is_empty() {
@@ -787,9 +1232,35 @@ fn run_session_end(hook_input: &Value, env: &Env, started: Instant) -> i32 {
     if !branch.is_empty() {
         meta.insert("branch".into(), json!(branch));
     }
+    add_ide(&mut meta, &root, env);
     meta.insert("repo_id".into(), json!(cfg.repo_id));
-    meta.insert("action".into(), json!("ended"));
-    let _ = http::post(
+    // a session that ended on its usage limit (`claude -p` and `codex exec`
+    // exit right after it; Codex sends no Stop for a failed turn, only
+    // this) stays shown as limited, with when it resets, not as ended
+    let limit = transcript::limit_note(&path);
+    if limit.is_empty() {
+        meta.insert("action".into(), json!("ended"));
+    } else {
+        meta.insert("action".into(), json!("limit"));
+        meta.insert("path".into(), json!(limit));
+    }
+    // what git says of the files it wrote (uncommitted, committed, pushed),
+    // so its handoff never passes last night's edits off as fresh work
+    if limit.is_empty() && remaining > GIT_STATE_BUDGET * 2 {
+        let state = config::load_json(&crate::check::state_path(&session, env));
+        let written: Vec<String> = state
+            .get("written_paths")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        if let Some(files) = git::files_state(&root, &written, GIT_STATE_BUDGET) {
+            meta.insert("git_files".into(), files);
+        }
+    }
+    // the session's protocol daemon releases its leases and ends
+    crate::proto::bye(env, &text(hook_input, "session_id"));
+    let remaining = TOTAL_BUDGET.checked_sub(started.elapsed()).unwrap_or_default();
+    let posted = http::post(
         &cfg.server,
         "/presence",
         &cfg.token,
@@ -797,11 +1268,17 @@ fn run_session_end(hook_input: &Value, env: &Env, started: Instant) -> i32 {
         &Value::Object(meta),
         remaining,
     );
+    if bill_landed(&posted) && !usage.is_empty() {
+        transcript::billed(&path, &usage, env);
+    }
     // then the briefing's final word for this session: every briefed path
     // still only read is a miss now, and the cost of carrying the briefing
     // is reported whether or not a path ever settled. Its own budget: the
     // retirement above is the post that must not be starved.
     crate::prompt::brief_outcome(hook_input, env, Instant::now(), true);
+    // trunk mode: a session that ended on a branch of its own, everything
+    // committed, has it landed into the trunk (detached)
+    crate::trunk::on_done(&root, &text(hook_input, "session_id"), "", "end", env);
     0
 }
 
@@ -829,11 +1306,12 @@ pub fn is_map_source(rel: &str) -> bool {
     MAP_EXTS.iter().any(|ext| lower.ends_with(ext)) && !is_collide_artifact(rel)
 }
 
-/// Collide's own installed files (`.collide/report_hook.py`, the gate, the
-/// config) are tracked by git in every repo setup touches. They are not the
-/// user's code: never indexed, reported, or counted as the session's work.
+/// Cork's own installed files (`.collide/report_hook.py`, the gate, the
+/// config in `.cork/` or `.collide/`) are tracked by git in every repo setup
+/// touches. They are not the user's code: never indexed, reported, or counted
+/// as the session's work.
 pub fn is_collide_artifact(rel: &str) -> bool {
-    rel.starts_with(".collide/") || rel.contains("/.collide/")
+    [".cork/", ".collide/"].iter().any(|dir| rel.starts_with(dir) || rel.contains(&format!("/{dir}")))
 }
 
 /// The file's text, or None when it is too large or unreadable.
@@ -856,7 +1334,7 @@ pub(crate) fn text_of_source(bytes: &[u8]) -> String {
     if text.contains("\r\n") { text.replace("\r\n", "\n") } else { text.into_owned() }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -868,17 +1346,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Keyed by the checkout AND where it reports: a checkout moved to another
 /// server, workspace or repo id starts a fresh index there instead of
 /// believing the new map already holds its files.
-fn index_state_path(root: &Path, env: &Env, server: &str, repo_id: &str) -> PathBuf {
-    let home = {
-        let collide_home = config::get(env, "COLLIDE_HOME");
-        let home = config::get(env, "HOME");
-        if !collide_home.is_empty() { collide_home.to_string() }
-        else if !home.is_empty() { home.to_string() }
-        else { "~".to_string() }
-    };
+pub(crate) fn index_state_path(root: &Path, env: &Env, server: &str, repo_id: &str) -> PathBuf {
     let key = format!("{}\n{server}\n{repo_id}", config::absolute(root).to_string_lossy());
     let digest = sha256_hex(key.as_bytes());
-    PathBuf::from(home).join(".collide").join("index").join(format!("{}.json", &digest[..16]))
+    config::data_dir(env).join("index").join(format!("{}.json", &digest[..16]))
 }
 
 pub(crate) fn save_json(path: &Path, value: &Value) {
@@ -965,9 +1436,9 @@ fn skipped_by_index(root: &Path, files: &[String]) -> std::collections::HashSet<
 }
 
 /// How many files the bulk index sends: past this, a repo's map starts from
-/// the code people work on (`COLLIDE_INDEX_MAX_FILES`).
+/// the code people work on (`CORK_INDEX_MAX_FILES`).
 fn index_max_files(env: &Env) -> usize {
-    config::get(env, "COLLIDE_INDEX_MAX_FILES").trim().parse().unwrap_or(6_000)
+    config::get(env, "CORK_INDEX_MAX_FILES").trim().parse().unwrap_or(6_000)
 }
 
 /// Files changed in git in the last half year, newest first.
@@ -1085,15 +1556,29 @@ fn now_s() -> f64 {
 /// did something.
 pub(crate) const BRIEF_BUDGET: u64 = 6_000;
 pub(crate) const BRIEF_TIMEOUT: Duration = Duration::from_secs(10);
+/// The handoffs waiting for this person in this repo, taken by this session
+/// (`cork handoff` sent while none of their sessions was open here). Fails
+/// open: no answer is no handoff.
+fn take_handoffs(cfg: &config::Config, session: &str) -> Vec<Value> {
+    if session.is_empty() {
+        return Vec::new();
+    }
+    let payload = json!({"repo_id": cfg.repo_id, "session": session});
+    http::post(&cfg.server, "/handoffs/take", &cfg.token, &user_agent(), &payload, BRIEF_TIMEOUT)
+        .ok()
+        .and_then(|answer| answer.get("handoffs").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+}
+
 /// SessionStart sources after which the agent's context is gone.
 pub(crate) const RESUME_SOURCES: [&str; 2] = ["compact", "resume"];
 
-/// The dashboard behind a server address: COLLIDE_DASHBOARD_URL when set,
+/// The dashboard behind a server address: CORK_DASHBOARD_URL when set,
 /// else the site the mcp.* (or api.*) host belongs to. Any other server —
 /// localhost, a self-hosted box — has no known dashboard, so none opens.
 /// Twin of the Python hook's `_dashboard_url`.
 pub(crate) fn dashboard_url(server: &str, env: &Env) -> String {
-    let explicit = config::get(env, "COLLIDE_DASHBOARD_URL").trim_end_matches('/');
+    let explicit = config::get(env, "CORK_DASHBOARD_URL").trim_end_matches('/');
     if !explicit.is_empty() {
         return format!("{explicit}/dashboard");
     }
@@ -1103,9 +1588,9 @@ pub(crate) fn dashboard_url(server: &str, env: &Env) -> String {
 }
 
 /// A browser opens only for a person at a desktop: never in CI, over SSH,
-/// in a test run, on a headless Linux box, or with COLLIDE_NO_BROWSER=1.
+/// in a test run, on a headless Linux box, or with CORK_NO_BROWSER=1.
 pub(crate) fn may_open_browser(env: &Env) -> bool {
-    let off = config::get(env, "COLLIDE_NO_BROWSER");
+    let off = config::get(env, "CORK_NO_BROWSER");
     if !off.is_empty() && off != "0" {
         return false;
     }
@@ -1119,33 +1604,21 @@ pub(crate) fn may_open_browser(env: &Env) -> bool {
     true
 }
 
-/// Open the workspace's dashboard the first time a session starts in it on
-/// this machine; the URL when it did, else empty. Remembered per workspace
-/// in ~/.collide/dashboard_opened.json BEFORE opening, so a browser that
-/// fails to launch is never retried every session. Twin of the Python
-/// hook's `_open_dashboard_once`.
-/// A repo no workspace has yet: open the dashboard on the question of where
-/// it goes (`?add_repo=`), once per repo on this machine. A repo already in
-/// a workspace opens nothing: the browser used to open on every first
-/// session in a workspace, wanted or not. Signed out, the dashboard sends
-/// the person through sign-in and back to the question.
-fn open_add_repo_once(server: &str, repo_id: &str, env: &Env) -> String {
-    let base = dashboard_url(server, env);
-    if base.is_empty() || repo_id.is_empty() || !may_open_browser(env) {
+/// A repo no workspace has yet: the browser opens on the question of where
+/// it goes (the site's /add-repo page, one click with the workspace its
+/// remote names already picked), once per repo on this machine, and on a
+/// Mac the app the agent runs in comes back to the front once it is
+/// answered (back.rs). A repo already in a workspace opens nothing: the
+/// browser used to open on every first session in a workspace, wanted or
+/// not. Remembered in ~/.collide/dashboard_opened.json BEFORE opening, so a
+/// browser that fails to launch is never retried every session. The URL
+/// when it opened, else empty.
+fn ask_where_once(server: &str, repo_id: &str, root: &Path, env: &Env) -> String {
+    if dashboard_url(server, env).is_empty() || repo_id.is_empty() || !may_open_browser(env) {
         return String::new();
     }
     let key = format!("add|{server}|{repo_id}");
-    let encoded: String = repo_id.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-        _ => format!("%{b:02X}"),
-    }).collect();
-    let url = format!("{base}?add_repo={encoded}");
-    let home = [config::get(env, "COLLIDE_HOME"), config::get(env, "HOME"), config::get(env, "USERPROFILE")]
-        .into_iter()
-        .find(|h| !h.is_empty())
-        .unwrap_or("")
-        .to_string();
-    let path = PathBuf::from(home).join(".collide").join("dashboard_opened.json");
+    let path = config::data_dir(env).join("dashboard_opened.json");
     let mut opened = config::load_json(&path);
     if opened.get(&key).is_some() {
         return String::new();
@@ -1159,30 +1632,108 @@ fn open_add_repo_once(server: &str, repo_id: &str, env: &Env) -> String {
     }
     opened[key.as_str()] = json!(stamp);
     save_json(&path, &opened);
+    let app = crate::back::host_app();
+    let url = add_repo_url(server, repo_id, app.as_ref().map(|a| a.name.as_str()).unwrap_or(""), env);
+    if url.is_empty() || !open_url(&url) {
+        return String::new();
+    }
+    if let Some(app) = &app {
+        crate::back::spawn_watch(root, repo_id, app, env);
+    }
+    url
+}
+
+/// Whether a session start asks the person where a new repo goes: the
+/// server says none of their workspaces has it, it is not a resumed
+/// session, and a person is there to answer. A headless run (`claude -p`,
+/// `codex exec`, CI) asks nothing: nobody would see the page, and the app
+/// it runs in would be pulled to the front for nothing.
+fn asks_where(brief: &Value, machine_local: bool, resume: bool, headless: bool) -> bool {
+    brief.get("new_repo").and_then(Value::as_bool) == Some(true) && !machine_local && !resume && !headless
+}
+
+/// The site's add-repo page for `repo_id`: `from` names the app the person
+/// goes back to once it is added. Signed out, the page sends them through
+/// sign-in and back to it.
+fn add_repo_url(server: &str, repo_id: &str, from: &str, env: &Env) -> String {
+    let base = dashboard_url(server, env);
+    let Some(site) = base.strip_suffix("/dashboard") else { return String::new() };
+    if repo_id.is_empty() {
+        return String::new();
+    }
+    let encode = |text: &str| -> String {
+        text.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    };
+    let mut url = format!("{site}/add-repo?repo={}", encode(repo_id));
+    if !from.is_empty() {
+        url.push_str(&format!("&from={}", encode(from)));
+    }
+    url
+}
+
+/// The default browser on `url`; whether it launched.
+pub(crate) fn open_url(url: &str) -> bool {
     let mut command = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", &url]);
+        c.args(["/C", "start", "", url]);
         c
     } else {
         let mut c = std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
-        c.arg(&url);
+        c.arg(url);
         c
     };
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    match command.spawn() {
-        Ok(_) => url,
-        Err(_) => String::new(),
+    command.spawn().is_ok()
+}
+
+/// How to hand work on, said last at session start, where every session
+/// reads it (nothing is written into the repo's own files); and, unless the
+/// person switched it off, the line its pull requests end with, to a
+/// harness whose hooks cannot add it themselves (prbadge.rs).
+fn on_here_line(env: &Env, harness: &str) -> String {
+    let mut line = format!(
+        "Cork is on here. When the user wants work handed to another agent or session (\"send this to Cork\", a spec, \
+a task), run `{} \"<self-contained spec>\"`: it reaches their other session open in this repo, which starts on it by \
+itself, or the next one they start. Never ask them to copy and paste between agents.",
+        crate::machine::own_command(env, "handoff")
+    );
+    if crate::machine::pr_badge_on(env) && !crate::prbadge::covers(harness) {
+        line.push_str(&format!(
+            " When you open a pull request (gh pr create or any tool's), end its description with this line, after any \
+other attribution lines: {}",
+            crate::machine::PR_BADGE_LINE
+        ));
     }
+    line
 }
 
 fn run_session_start(hook_input: &Value, env: &Env) -> i32 {
-    // a signed-in free machine whose workspace went paid moves over first,
-    // so this session already starts on Collide's servers
+    // a signed-in machine still local (signed in on Free before v100) moves
+    // over first, so this session already starts on Cork's servers
     let moved = crate::machine::plan_check(env);
-    // a machine install updates itself (both binaries) from Collide's
+    let moved: Vec<String> = moved.into_iter().chain(crate::harnesses::session_start(hook_input, env)).collect(); // tools installed since Cork
+    // a resumed or compacted conversation bills from here on: what it said
+    // before was billed by the run that said it
+    if RESUME_SOURCES.contains(&text(hook_input, "source").as_str()) {
+        transcript::start_billing_here(&text(hook_input, "transcript_path"), env);
+    }
+    // a compacted or cleared context lost every briefing in it: the next
+    // call in each repo briefs again (touch.rs)
+    if matches!(text(hook_input, "source").as_str(), "compact" | "clear") {
+        crate::touch::clear(&text(hook_input, "session_id"), env);
+    }
+    // what Claude Code calls this session, read again now: a resumed one may
+    // have been renamed (every later call reads the kept name)
+    transcript::session_name(&text(hook_input, "session_id"), true, env);
+    // a machine install updates itself (both binaries) from Cork's
     // releases, now and then; the local server has none to offer
     if crate::machine::installed(env) {
         crate::selfupdate::spawn_if_due(&crate::machine::update_server(env), env);
@@ -1200,6 +1751,12 @@ fn run_session_start(hook_input: &Value, env: &Env) -> i32 {
     if !cfg.usable() {
         return 0;
     }
+    // a folder that was another repo id (its origin changed): said before
+    // anything is reported under the new id, so the server can carry the
+    // old repo's history over instead of starting the new id apart
+    if !cfg.machine_local {
+        crate::renames::report_repo_rename(&root, &cfg, env);
+    }
     let (sent, left) = index_repo(&root, &cfg, env, INDEX_BUDGET);
     crate::machine::mark_indexed(&root, &cfg.server, env);
     let mut said: Vec<String> = moved.into_iter().collect();
@@ -1210,12 +1767,19 @@ fn run_session_start(hook_input: &Value, env: &Env) -> i32 {
         said.push(crate::machine::free_note(env));
     }
     // a repo covered through this machine's install: the agent may offer
-    // the user Collide's AGENTS.md section (it never writes it unasked)
-    if !RESUME_SOURCES.contains(&text(hook_input, "source").as_str()) && crate::machine::installed(env) {
+    // the user Cork's AGENTS.md section (it never writes it unasked)
+    // (only to a session with a person at it: a headless agent cannot ask)
+    let fresh = !RESUME_SOURCES.contains(&text(hook_input, "source").as_str());
+    if fresh && crate::machine::installed(env) && !crate::harness::headless(hook_input, env) {
         if let Some(ask) = crate::machine::agents_md_ask(&root, env) {
             said.push(ask);
         }
     }
+    // no tip on how to message the others here: said at session start, it
+    // made every agent announce its plan to every other (Study 8, second
+    // study: 58-141 message batches per round). It is said when the prompt
+    // asks to tell others (prompt.rs) or the agent changes code others call
+    // (`dependents_note`).
     if left > 0 {
         // a large tree finishes detached rather than holding the session
         if let Ok(exe) = std::env::current_exe() {
@@ -1234,9 +1798,13 @@ fn run_session_start(hook_input: &Value, env: &Env) -> i32 {
             let _ = command.spawn();
         }
     }
+    // the repo's own history as weekly counts, at most daily, detached
+    crate::gitsignal::spawn_baseline_if_due(&root, env);
+    // files and folders git saw renamed since the last look, detached
+    crate::renames::spawn_if_due(&root, env);
     if sent > 0 || left > 0 {
         let tail = if left > 0 { format!(", {left} more in the background") } else { String::new() };
-        said.push(format!("Collide: map indexed {sent} source file(s){tail}."));
+        said.push(format!("Cork: map indexed {sent} source file(s){tail}."));
     }
     // the briefing: the repo's shape on one page and the recently changed
     // modules as exact facts, printed into the session so the first message
@@ -1245,13 +1813,17 @@ fn run_session_start(hook_input: &Value, env: &Env) -> i32 {
     // verdict is said first, and what was briefed before counts as unseen.
     let session = text(hook_input, "session_id");
     let resume = RESUME_SOURCES.contains(&text(hook_input, "source").as_str());
-    let mut payload = json!({"repo_id": cfg.repo_id, "budget": BRIEF_BUDGET});
-    // every branch and worktree of the repo, by name: the dashboard's
-    // switchers list them all, not only the ones an agent is on now
-    if !resume {
-        if let Some(map) = payload.as_object_mut() {
-            map.insert("branches".into(), json!(git::local_branches(&root)));
-            map.insert("worktrees".into(), json!(git::worktree_names(&root)));
+    // `verifies`: each symbol line is checked against this copy before it is
+    // printed (mapcheck.rs), so the server may say to build on them
+    let mut payload = json!({"repo_id": cfg.repo_id, "budget": BRIEF_BUDGET, "verifies": true});
+    // every branch of the repo, by name, on every start (a resumed or
+    // compacted session too: most sessions only ever start that way, and
+    // the server forgets a list after a week): the dashboard's branch
+    // switcher lists them all, not only the ones an agent is on now
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("branches".into(), json!(git::branches(&root)));
+        if !resume {
+            add_ide(map, &root, env);
         }
     }
     if resume {
@@ -1265,6 +1837,14 @@ fn run_session_start(hook_input: &Value, env: &Env) -> i32 {
             said.push(line);
         }
     }
+    // the worktrees agent tools make for parallel sessions (any tool's): why
+    // this checkout doesn't need one, and tidying the finished ones
+    // (detached, never one with work in it)
+    if !resume {
+        if let Some(note) = crate::worktrees::session_start(&root, env) {
+            said.push(note);
+        }
+    }
     if !cfg.machine_local {
         // where this repo lives, for the wake watcher; a listener that hands
         // teammates' messages to this session the moment they are sent
@@ -1273,19 +1853,59 @@ fn run_session_start(hook_input: &Value, env: &Env) -> i32 {
         if let Some(note) = crate::wake::woken_note(&cfg.repo_id, env) {
             said.push(note);
         }
+    } else if crate::proto::enabled(&root, &cfg, env) {
+        // the local server with the protocol switched on: the session's daemon only
+        crate::proto::spawn_daemon(&root, &session, env);
+    }
+    // the handoffs that waited for a session of this person here, taken by
+    // this one as its to-do
+    let picked = take_handoffs(&cfg, &session);
+    for handoff in &picked {
+        let from = text(handoff, "from");
+        // its reply to the sender is the person's sign it is done (pings.rs)
+        crate::pings::took_handoff(env, &root, &session, &from, &text(handoff, "message"));
+        said.push(format!(
+            "Cork: a handoff waited for this session, from {from} ({}): it is your to-do now. Start on it, tell the user \
+in one line that you picked it up, and when it is done tell the sender: `{} --to {from} \"...\"`.{}\n{}",
+            crate::listen::age_words(handoff.get("age_s").and_then(Value::as_f64).unwrap_or(0.0)),
+            crate::machine::own_command(env, "message"),
+            // who Cork says sent it, which its own words cannot change
+            crate::listen::provenance(handoff),
+            text(handoff, "message").trim(),
+        ));
+    }
+    // a session with a person at it: the server says, on their first start
+    // here after a while away, what happened since they left
+    if let Some(map) = payload.as_object_mut().filter(|_| !crate::harness::headless(hook_input, env)) {
+        if !matches!(text(hook_input, "source").as_str(), "compact" | "clear") {
+            map.insert("morning".into(), json!(true));
+            map.insert("picked".into(), json!(picked.len()));
+        }
     }
     if let Ok(brief) = http::post(&cfg.server, "/brief", &cfg.token, &user_agent(), &payload, BRIEF_TIMEOUT) {
-        // a repo no workspace has: the dashboard asks where it goes
-        if brief.get("new_repo").and_then(Value::as_bool) == Some(true) && !cfg.machine_local && !resume {
-            let opened = open_add_repo_once(&cfg.server, &cfg.repo_id, env);
-            if !opened.is_empty() {
+        // briefed on this repo: its first file is not a first touch
+        if brief.get("ok").and_then(Value::as_bool) == Some(true) {
+            crate::touch::mark(&session, &cfg.repo_id, env);
+        }
+        // the repo's trunk mode rides every briefing (trunk.rs)
+        crate::trunk::remember(&cfg.repo_id, &brief, env);
+        let morning: Vec<&str> = brief.get("morning").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        if !morning.is_empty() {
+            said.push(format!("{}\nTell the user this in one or two lines before anything else.", morning.join("\n")));
+        }
+        // a repo no workspace has: the site asks where it goes
+        if asks_where(&brief, cfg.machine_local, resume, crate::harness::headless(hook_input, env)) {
+            let asked = ask_where_once(&cfg.server, &cfg.repo_id, &root, env);
+            if !asked.is_empty() {
                 said.push(format!(
-                    "Collide: this repo is in none of the user's workspaces yet, so the dashboard opened in the browser \
-to add it ({opened}). Tell the user in one line to pick its workspace there."
+                    "Cork: this repo is in none of the user's workspaces yet, so the browser opened to add it \
+({asked}). Tell the user in one line to pick its workspace there."
                 ));
             }
         }
-        let text = brief.get("text").and_then(Value::as_str).unwrap_or("");
+        // what this copy of each file does not have is never printed
+        let checked = crate::mapcheck::apply(&root, &brief).text;
+        let text = checked.as_str();
         if !text.is_empty() {
             said.push(text.to_string());
         }
@@ -1294,8 +1914,18 @@ to add it ({opened}). Tell the user in one line to pick its workspace there."
         let covered = brief.get("covered").and_then(Value::as_array).cloned().unwrap_or_default();
         crate::prompt::remember_briefed(&session, &paths, &named, text, &covered, env);
     }
-    // once a day on the free version: what Collide did, shown to the person
-    let summary = crate::machine::daily_summary(&cfg, env);
+    // trunk mode: where work lands here, said over the agent's own "branch
+    // first"; and what became of this person's branches
+    said.extend(crate::trunk::session_start(&root, &cfg, &session, env));
+    said.push(on_here_line(env, crate::harness::current()));
+    // once a day on the free version: what Cork did, shown to the person;
+    // and a handoff this session picked up, which the person should know of
+    let picked_line = picked.first().map(|first| {
+        let spec: String = text(first, "message").lines().next().unwrap_or("").chars().take(90).collect();
+        let more = if picked.len() > 1 { format!(" (and {} more)", picked.len() - 1) } else { String::new() };
+        format!("Cork: this session picked up a handoff{more}: {spec}")
+    });
+    let summary = [crate::machine::daily_summary(&cfg, env), picked_line].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"));
     // one emission in whatever shape this harness reads back
     match summary {
         Some(line) if crate::harness::current() == "claude" => {
@@ -1372,10 +2002,27 @@ pub fn run(stdin_data: &str, env: &Env) -> i32 {
     code
 }
 
+/// The file as it was before an Edit/Write, when the harness hands it over
+/// (Claude Code's `originalFile`; a Write that created the file had none).
+fn original_file(hook_input: &Value) -> Option<Vec<u8>> {
+    let response = hook_input.get("tool_response")?;
+    match response.get("originalFile") {
+        Some(Value::String(body)) => Some(body.clone().into_bytes()),
+        _ if text(response, "type") == "create" => Some(Vec::new()),
+        _ => None,
+    }
+}
+
 fn run_event(stdin_data: &str, env: &Env) -> i32 {
     let started = Instant::now();
     let Ok(hook_input) = serde_json::from_str::<Value>(stdin_data) else { return 0 };
     let hook_input = crate::harness::normalize(hook_input);
+    // the permission mode it runs in, which a message it sends to another
+    // Claude Code session attests (peer.rs)
+    crate::peer::note_mode(&text(&hook_input, "session_id"), &text(&hook_input, "permission_mode"), env);
+    if let Ok(mut slot) = HELD_FOR.lock() {
+        *slot = Some((env.clone(), text(&hook_input, "session_id")));
+    }
     // ConfigChange must return before this: Claude Code discards
     // additionalContext on that event, so a verdict moved into the pending
     // slot here would be emitted into a channel that throws it away — lost,
@@ -1386,6 +2033,15 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
     // likewise SessionEnd: nothing printed here reaches anyone
     if text(&hook_input, "hook_event_name") == "SessionEnd" {
         return run_session_end(&hook_input, env, started);
+    }
+    // and StopFailure: a turn that ended on an API error (a usage limit),
+    // sent by Claude Code instead of Stop; nothing it prints is read
+    if text(&hook_input, "hook_event_name") == "StopFailure" {
+        return run_stop(&hook_input, env, started);
+    }
+    // and SubagentStop: Claude Code shows the subagent's caller nothing of it
+    if text(&hook_input, "hook_event_name") == "SubagentStop" {
+        return run_subagent_stop(&hook_input, env, started);
     }
     // a call that failed changed nothing: the agent is running, and that is
     // all it reports (Claude Code sends no PostToolUse for it, so a session
@@ -1400,10 +2056,17 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
         return crate::check::run_post_tool_batch(&hook_input, env);
     }
     if text(&hook_input, "hook_event_name") == "UserPromptSubmit" {
-        // a free machine whose workspace just went paid (`collide upgrade`)
-        // moves over at the next prompt, not only at the next session
+        // a turn starts: the session is busy until its Stop (pings.rs)
+        crate::pings::turn_started(&text(&hook_input, "session_id"), env);
+        // a release reaches a machine at work at its next prompt, at most
+        // one check an hour (selfupdate::RETRY_S), not only at session starts
+        if crate::machine::installed(env) {
+            crate::selfupdate::spawn_if_due(&crate::machine::update_server(env), env);
+        }
+        // a signed-in machine still local moves over at the next prompt, not
+        // only at the next session
         let moved = crate::machine::plan_check(env);
-        // a session already open when Collide was installed hears it now, once
+        // a session already open when Cork was installed hears it now, once
         let notes: Vec<String> = moved.into_iter().chain(crate::machine::welcome_once(&hook_input, env)).collect();
         let moved = (!notes.is_empty()).then(|| notes.join("\n\n"));
         let code = crate::prompt::run_user_prompt(&hook_input, env);
@@ -1433,6 +2096,10 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
         return code;
     }
     let tool = text(&hook_input, "tool_name");
+    // a pull request the command just opened gets Cork's badge, detached
+    if !failed && SHELL_TOOLS.contains(&tool.as_str()) && text(&hook_input, "hook_event_name") == "PostToolUse" {
+        crate::prbadge::after_shell(&hook_input, env);
+    }
     if !WRITE_TOOLS.contains(&tool.as_str()) && !READ_TOOLS.contains(&tool.as_str()) {
         return 0;
     }
@@ -1446,13 +2113,18 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
     };
     let tool_input = hook_input.get("tool_input").cloned().unwrap_or(Value::Null);
     let session_id = text(&hook_input, "session_id");
-    crate::prompt::note_call(&session_id, env);
 
     // locate the repo root: the edited file's directory is the strongest hint,
     // then the cwd, then the harness-provided project dir. Paths are reported
     // relative to this root so a drifted cwd cannot fragment a file's identity.
     let mut is_write = !failed && WRITE_TOOLS.contains(&tool.as_str());
     let mut targets: Vec<PathBuf> = Vec::new();
+    let project_dir = config::get(env, "CLAUDE_PROJECT_DIR");
+    // the repo the SESSION works in (its folder, else its project)
+    let session_root = config::find_repo_root(&[
+        Some(cwd.clone()),
+        (!project_dir.is_empty()).then(|| PathBuf::from(project_dir)),
+    ]);
     let hint = if is_write {
         targets = {
             let direct = {
@@ -1479,9 +2151,21 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
         (!read_path.is_empty())
             .then(|| PathBuf::from(&read_path).parent().map(Path::to_path_buf))
             .flatten()
+            // a command that works somewhere else (`cd ~/code/app && …`, a
+            // file named by its full path) is that folder's repo's activity:
+            // what lets a chat started in a project folder be seen at all.
+            // Only for a session that works in no repo: a command of a
+            // session in a repo is that repo's, whatever paths it names.
+            // Study 9: agents in their own clones named paths inside another
+            // checkout (Cork's landing command carries CORK_HOME), and
+            // were reported into, and heard from, that other repo.
+            .or_else(|| {
+                (SHELL_TOOLS.contains(&tool.as_str()) && session_root.is_none())
+                    .then(|| shell::dir_hint(&text(&tool_input, "command"), &cwd, &config::get(env, "HOME")))
+                    .flatten()
+            })
     };
 
-    let project_dir = config::get(env, "CLAUDE_PROJECT_DIR");
     let root = config::find_repo_root(&[
         hint,
         Some(cwd.clone()),
@@ -1500,9 +2184,103 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
     // majority of an agent's tool calls, and a session that only read used to
     // drift arbitrarily far behind with no signal. Cost is bounded — the
     // network fetch is throttled and the local fast-forward is microseconds.
-    let sync_note = git::sync_note(&root, git::auto_pull_enabled(&root, &config::get(env, "COLLIDE_AUTO_PULL")));
+    let sync_note = git::sync_note_with(&root, git::auto_pull_enabled(&root, &config::get(env, "CORK_AUTO_PULL")), crate::land::lands(&root, env));
+    // commits that arrived from elsewhere become ops on the protocol (detached)
+    crate::proto::maybe_ingest(&root, &cfg, env, &session_id);
+    if crate::proto::enabled(&root, &cfg, env) {
+        if let Ok(mut slot) = NOTICES_FOR.lock() {
+            *slot = Some((env.clone(), session_id.clone()));
+        }
+    }
+    // the folder's branch moved since this session's last step, and not by
+    // this step: said once, with whatever else this call has to say
+    let step_command = if SHELL_TOOLS.contains(&tool.as_str()) { text(&tool_input, "command") } else { String::new() };
+    let switched = crate::switches::observe(&root, &session_id, &step_command, env);
+    // trunk mode: a branch this step made is reminded of once, never held
+    let made = if failed || step_command.is_empty() { String::new() } else { crate::trunk::after_command(&root, &cfg, &session_id, &step_command, env) };
+    let switched = crate::prompt::join_notes(&[&switched, &made]);
+    if !switched.is_empty() {
+        if let Ok(mut slot) = SWITCHED.lock() {
+            *slot = switched;
+        }
+    }
 
-    let mut meta = transcript::turn_meta(&text(&hook_input, "transcript_path"));
+    let transcript_path = text(&hook_input, "transcript_path");
+    let mut meta = transcript::turn_meta_in(&transcript_path, env);
+    // the message that made this call replayed the context once, however
+    // many tool calls it made; a subagent's message replayed its own
+    let worker = text(&hook_input, "agent_id");
+    let message = meta.remove("turn_id").and_then(|id| id.as_str().map(str::to_string)).unwrap_or_default();
+    crate::prompt::note_call(&session_id, !worker.is_empty(), &message, env);
+    // what the message that made this call cost, for the dashboard's line
+    // only (`step`): a subagent's call reads its own transcript
+    let step = if worker.is_empty() {
+        transcript::step_of(&meta, &message)
+    } else {
+        let own = transcript::subagent_transcript(&text(&hook_input, "agent_transcript_path"), &transcript_path, &worker);
+        let own_meta = transcript::turn_meta(&own);
+        transcript::step_of(&own_meta, own_meta.get("turn_id").and_then(Value::as_str).unwrap_or(""))
+    };
+    // the usage is billed from the transcript at Stop, every message once;
+    // a call carries only the context it was made in, which prices a saving
+    for key in transcript::USAGE_KEYS {
+        meta.remove(key);
+    }
+    if let Some(step) = step {
+        meta.insert("step".into(), step);
+    }
+    // a long turn bills what it has spent so far every few minutes, so the
+    // agent-hours meter moves mid-turn (a subagent's transcript is billed
+    // by its own SubagentStop and the sweep)
+    if worker.is_empty() && transcript::bill_due(&transcript_path, env) {
+        let usage = transcript::take_unbilled(&transcript_path, env);
+        if !usage.is_empty() {
+            let bill = json!({"repo_id": cfg.repo_id, "session": session_id, "agent": user_agent(), "action": "usage", "usage": usage});
+            // a short timeout: this rides a tool call the agent is waiting on;
+            // what does not land now is owed and goes with the next bill
+            if bill_landed(&http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &bill, Duration::from_millis(800))) {
+                transcript::billed(&transcript_path, &usage, env);
+            }
+        }
+    }
+    // what the harness calls this conversation, for the roster
+    let title = transcript::title(&transcript_path, env);
+    if !title.is_empty() {
+        meta.insert("title".into(), json!(title));
+    }
+    // and what it is doing now: the item its todo list has in progress, else
+    // what its latest prompt asked. Its work is labelled by that, never by a
+    // title generated for an earlier task
+    if tool == "TodoWrite" {
+        transcript::note_task(&session_id, &transcript::todo_in_progress(&tool_input), env);
+    }
+    let task = transcript::current_task(&session_id, env);
+    if !task.is_empty() {
+        meta.insert("task".into(), json!(task));
+    }
+    // the session's stated intent rides on the protocol ops it makes, unless
+    // the workspace keeps titles (and tasks) off its servers
+    let intent = if task.is_empty() { &title } else { &task };
+    if !intent.is_empty() {
+        if crate::privacy::switches(&cfg.server, &cfg.repo_id).session_titles {
+            crate::proto::note_intent(env, &session_id, intent);
+        } else {
+            crate::proto::forget_intent(env, &session_id);
+        }
+    }
+    // and what Claude Code calls it (its ListAgents' name, which a message
+    // `--to` takes), and the harness it runs in
+    let cc_name = transcript::session_name(&session_id, false, env);
+    if !cc_name.is_empty() {
+        meta.insert("cc_name".into(), json!(cc_name));
+    }
+    meta.insert("harness".into(), json!(crate::harness::current()));
+    // what another session posted into this one through Claude Code, as its
+    // transcript shows it arrived: Cork holds its own copy until told
+    let peer_seen = transcript::peer_seen(&session_id, &transcript_path, env);
+    if !peer_seen.is_empty() {
+        meta.insert("peer_seen".into(), json!(peer_seen));
+    }
     // Which conversation made this edit. Claude Code hands every hook a
     // session_id, and a subagent has its own — so forwarding it is what lets
     // the ledger tell one agent's spend from another's when several work
@@ -1515,18 +2293,28 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
     // a tool call made inside a subagent carries the parent's session_id and
     // its own agent_id: the worker. Forwarded so the server can count how
     // many hands one conversation has on the repo right now.
-    let worker = text(&hook_input, "agent_id");
     if !worker.is_empty() {
         meta.insert("worker".into(), json!(worker));
         let worker_type = text(&hook_input, "agent_type");
         if !worker_type.is_empty() {
             meta.insert("worker_type".into(), json!(worker_type));
         }
+        // and the name it was started with, the dashboard's label for it
+        let worker_name = transcript::worker_name(&transcript_path, &worker);
+        if !worker_name.is_empty() {
+            meta.insert("worker_name".into(), json!(worker_name));
+        }
     }
     let branch = git::branch(&root);
     if !branch.is_empty() {
         meta.insert("branch".into(), json!(branch));
     }
+    // where its pushes land, when they land through Cork (branches.rs)
+    let (_, target) = crate::branches::of(&root, env);
+    if !target.is_empty() {
+        meta.insert("target".into(), json!(target));
+    }
+    add_ide(&mut meta, &root, env);
     let machine = machine_id(env);
     if !machine.is_empty() {
         meta.insert("machine".into(), json!(machine));
@@ -1534,11 +2322,6 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
         // every change on disk; two checkouts only share what is pushed
         let checkout = sha256_hex(format!("{machine}\n{}", root.display()).as_bytes());
         meta.insert("checkout".into(), json!(checkout.get(..16).unwrap_or("")));
-        // and which one by name, for the dashboard's worktree filter: the
-        // folder's own name only, never the path above it
-        if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-            meta.insert("worktree".into(), json!(name));
-        }
     }
     // the git origin as a repo id: when it disagrees with the committed config
     // the server treats it as a rename and hands back preferred_repo_id
@@ -1548,16 +2331,110 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
     }
 
     // a shell command that actually changed files is a WRITE, whatever the
-    // harness labelled it
+    // harness labelled it: what changed while it ran, against the gate's
+    // snapshot (shellrun.rs). Without one, what it names, and the clock's
+    // guess at what it never named only while no other session works in
+    // this checkout: in a shared one that guess took a teammate's edit.
+    let mut befores: std::collections::HashMap<PathBuf, Vec<u8>> = std::collections::HashMap::new();
+    let mut journal_targets: Vec<PathBuf> = Vec::new();
     if !is_write && SHELL_TOOLS.contains(&tool.as_str()) {
-        let shell_targets = shell::shell_write_targets(&text(&tool_input, "command"), &cwd, &root);
+        let command = text(&tool_input, "command");
+        let call = crate::shellrun::call_key(&text(&hook_input, "tool_use_id"), &command);
+        let proven = if session_id.is_empty() {
+            None
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::shellrun::finish(&root, &session_id, &call, env)))
+                .ok()
+                .flatten()
+        };
+        let shell_targets: Vec<PathBuf> = match proven {
+            Some(proven) => proven.files.into_iter().map(|(rel, before)| {
+                let target = root.join(&rel);
+                if let Some(bytes) = before {
+                    befores.insert(target.clone(), bytes);
+                }
+                target
+            }).collect(),
+            None if command.trim().is_empty() || shell::read_only(&command) => Vec::new(),
+            None => {
+                let since = crate::journal::now_s() - shell::SHELL_WRITE_WINDOW_S;
+                let alone = session_id.is_empty() || !crate::shellrun::others_at_work(&root, &session_id, since, env);
+                shell::shell_write_targets_with(&command, &cwd, &root, alone)
+                    .into_iter()
+                    .filter(|t| {
+                        alone || config::rel_path(t, &root).is_some_and(|rel| !crate::shellrun::other_wrote(&root, &rel, &session_id, since, env))
+                    })
+                    .collect()
+            }
+        };
         if !shell_targets.is_empty() {
             is_write = true;
+            // every file is journaled; the server hears the first few now
+            // and is owed the rest, which go with the next run's budget
+            journal_targets = shell_targets.clone();
             targets = shell_targets;
+            if targets.len() > shell::MAX_SHELL_WRITE_FILES {
+                for rest in &targets[shell::MAX_SHELL_WRITE_FILES..] {
+                    if let Some(rel) = config::rel_path(rest, &root).filter(|rel| !is_collide_artifact(rel) && !is_build_output(rel)) {
+                        crate::prompt::note_touch(&session_id, "written", &rel, env);
+                        crate::spool::remember(env, &cfg.server, &cfg.repo_id, &root, &rel, &meta);
+                    }
+                }
+                targets.truncate(shell::MAX_SHELL_WRITE_FILES);
+            }
+        }
+    }
+    if journal_targets.is_empty() {
+        journal_targets = targets.clone();
+    }
+
+    // the first call in a repo this session was not briefed on: the small
+    // briefing rides in on this call's result (touch.rs). A call in the
+    // session's own repo, or any later call, is a local file read. It has
+    // its own short allowance, not what the call's budget has left: a slow
+    // git fetch before it left none, and the repo was never briefed.
+    if !failed && !session_id.is_empty() {
+        let touched: Vec<String> = if is_write {
+            targets.iter().filter_map(|t| config::rel_path(t, &root)).collect()
+        } else {
+            let read_path = {
+                let file_path = text(&tool_input, "file_path");
+                if file_path.is_empty() { text(&tool_input, "path") } else { file_path }
+            };
+            (!read_path.is_empty()).then(|| config::rel_path(Path::new(&read_path), &root)).flatten().into_iter().collect()
+        };
+        let touched: Vec<String> = touched.into_iter().filter(|rel| rel != "." && !is_collide_artifact(rel)).collect();
+        let said = crate::touch::note(&cfg, &session_id, &touched, is_write, crate::touch::TIMEOUT, env);
+        if !said.is_empty() {
+            if let Ok(mut slot) = FIRST_TOUCH.lock() {
+                *slot = said;
+            }
         }
     }
 
-    // local work is not Collide's to spend: git (the fetch, and every spawn
+    // which lines this session wrote, journaled on this machine only, so a
+    // commit in a shared checkout can take this session's hunks and no one
+    // else's (journal.rs). Local and bounded; a failure records nothing.
+    // A helper's lines are its own: to its lead and its siblings, a
+    // teammate's (lines.rs)
+    if is_write && !session_id.is_empty() {
+        let worker_name = if worker.is_empty() { String::new() } else { transcript::worker_name(&transcript_path, &worker) };
+        let original = (targets.len() == 1 && matches!(tool.as_str(), "Edit" | "Write" | "MultiEdit"))
+            .then(|| original_file(&hook_input))
+            .flatten();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for target in &journal_targets {
+                let Some(rel) = config::rel_path(target, &root) else { continue };
+                if is_collide_artifact(&rel) || is_build_output(&rel) {
+                    continue;
+                }
+                let before = befores.get(target).cloned().or_else(|| original.clone());
+                crate::journal::record(&root, target, &rel, &session_id, &worker, &worker_name, &title, before, env);
+            }
+        }));
+    }
+
+    // local work is not Cork's to spend: git (the fetch, and every spawn
     // that reads the branch, the origin or the ignore rules, 50-150 ms each
     // on Windows) and the disk are discounted, so the budget bounds the
     // network alone and a slow machine can never starve the post that follows
@@ -1569,112 +2446,164 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
     };
 
     if is_write {
-        let mut context = String::new();
-        let agents_version = agents_block_version(&root);
-        let digest = settings_digest(&root);
-        let payload_for = |rel: &str, content: &str, meta: &Map<String, Value>| -> Value {
-            let mut payload = meta.clone();
-            payload.insert("repo_id".into(), json!(cfg.repo_id));
-            payload.insert("path".into(), json!(rel));
-            payload.extend(cfg.source_fields(rel, content));
-            payload.insert("hook_version".into(), json!(HOOK_VERSION));
-            payload.insert("agents_version".into(), json!(agents_version));
-            payload.insert("settings_digest".into(), json!(digest));
-            Value::Object(payload)
-        };
-        // reports an earlier run could not deliver go first, as the files
-        // are now, with a third of this run's budget at most
-        local.set(started.elapsed());
-        let resend_budget = budget_left() / 3;
-        crate::spool::resend(env, &cfg.server, &cfg.repo_id, &cfg.token, &user_agent(), &root, resend_budget,
-            &|rel, content, meta| (!is_collide_artifact(rel)).then(|| payload_for(rel, content, meta)));
-        for target in &targets {
-            let Some(rel) = config::rel_path(target, &root) else { continue };
-            if is_collide_artifact(&rel) {
-                continue;
-            }
-            // before note_touch as well: a scratch file is not the session's
-            // work either, and counting it would flatter the hit rate
-            let git_started = Instant::now();
-            let ignored = is_build_output(&rel) || git::is_ignored(&root, &rel);
-            local.set(local.get() + git_started.elapsed());
-            if ignored {
-                continue;
-            }
-            crate::prompt::note_touch(&session_id, "written", &rel, env);
-            match std::fs::metadata(target) {
-                Ok(meta) if meta.len() > MAX_FILE_BYTES => continue,
-                Err(_) => continue, // a deleted file (apply_patch delete) or unreadable
-                _ => {}
-            }
-            let Ok(bytes) = std::fs::read(target) else { continue };
-            let content = text_of_source(&bytes);
-            if budget_left().is_zero() {
-                break;
-            }
-            let payload = payload_for(&rel, &content, &meta);
-            let response = match http::post(&cfg.server, "/report", &cfg.token, &user_agent(), &payload, budget_left()) {
-                Ok(response) => {
-                    crate::spool::forget(env, &cfg.server, &cfg.repo_id, &rel);
-                    response
-                }
-                // the server did not get it: owed, and sent again next run
-                Err(()) => {
-                    crate::spool::remember(env, &cfg.server, &cfg.repo_id, &rel, &meta);
-                    Value::Object(Default::default())
-                }
-            };
-
-            // a certain interface change: its dependents' tests run detached
-            // and grade the change on the graph; nothing of it reaches the agent
-            if let Some(plan) = response.get("verify").filter(|p| p.get("tests").and_then(Value::as_array).is_some_and(|t| !t.is_empty())) {
-                crate::verify::spawn(&root, &session_id, plan);
-            }
-            let fix_note =
-                apply_mechanical(&response, &root, target, &rel, &content, &cfg, &meta, budget_left());
-            let lint_note = lint_context(&response, !fix_note.is_empty(), &root);
-            let rename_note = adopt_preferred_repo_id(&response, &root, &cfg.repo_id);
-            let awareness = if context.is_empty() { awareness_context(&response) } else { context.clone() };
-            let pieces = [
-                fix_note,
-                lint_note,
-                rename_note,
-                setup_note(&response, &root),
-                sync_note.clone(),
-                artifacts_note(&response, &root, &cfg.server, env),
-                ask_why_note(&response),
-                prefetch_note(&response, &session_id, env),
-                awareness,
-                crate::machine::inbox(&response),
-            ];
-            let mut kept: Vec<String> = Vec::new();
-            for piece in pieces.into_iter().filter(|p| !p.is_empty()) {
-                if !kept.contains(&piece) {
-                    kept.push(piece);
-                }
-            }
-            if !kept.is_empty() {
-                context = kept.join("\n");
-            }
-        }
-        // a test run that also left files behind (`pytest 2>&1 | tail` just
-        // after an edit reads as a shell write): its verdict still counts,
-        // and it goes after the writes it judged
-        if SHELL_TOOLS.contains(&tool.as_str()) && !budget_left().is_zero() {
-            let command = text(&tool_input, "command");
-            let failed = FAILED_CALL.load(std::sync::atomic::Ordering::Relaxed);
-            if let Some(ok) = test_verdict(&command, &shell_output(&hook_input), failed) {
+        // the protocol's ops for this write go out beside the report: the
+        // map keeps learning from /report, the protocol is additive
+        let protocol = WRITE_TOOLS.contains(&tool.as_str()) && !session_id.is_empty() && crate::proto::enabled(&root, &cfg, env);
+        let proto_ctx = crate::proto::Ctx { root: &root, cfg: &cfg, env, session: &session_id };
+        let proto_targets = targets.clone();
+        return std::thread::scope(|scope| {
+            let refused = protocol.then(|| scope.spawn(|| crate::proto::report(&proto_ctx, &proto_targets)));
+            let mut context = String::new();
+            let agents_version = agents_block_version(&root);
+            let digest = settings_digest(&root);
+            let payload_for = |rel: &str, content: &str, meta: &Map<String, Value>| -> Value {
                 let mut payload = meta.clone();
                 payload.insert("repo_id".into(), json!(cfg.repo_id));
-                payload.insert("path".into(), json!(shown_command(command.trim())));
-                payload.insert("action".into(), json!("running"));
-                payload.insert("tests_ok".into(), json!(ok));
-                let _ = http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &Value::Object(payload), budget_left());
+                payload.insert("path".into(), json!(rel));
+                payload.extend(cfg.source_fields(rel, content));
+                payload.insert("hook_version".into(), json!(HOOK_VERSION));
+                payload.insert("agents_version".into(), json!(agents_version));
+                payload.insert("settings_digest".into(), json!(digest));
+                Value::Object(payload)
+            };
+            // reports an earlier run could not deliver go first, as the files
+            // are now, with a third of this run's budget at most
+            local.set(started.elapsed());
+            let resend_budget = budget_left() / 3;
+            // the files this run reports live are owed no longer
+            let covered: Vec<String> = targets.iter().filter_map(|t| config::rel_path(t, &root)).collect();
+            crate::spool::resend(env, &cfg.server, &cfg.repo_id, &cfg.token, &user_agent(), resend_budget, &root, &covered,
+                &|rel, content, meta| (!is_collide_artifact(rel)).then(|| payload_for(rel, content, meta)));
+            for target in &targets {
+                let Some(rel) = config::rel_path(target, &root) else { continue };
+                if is_collide_artifact(&rel) {
+                    continue;
+                }
+                // before note_touch as well: a scratch file is not the session's
+                // work either, and counting it would flatter the hit rate
+                let git_started = Instant::now();
+                let ignored = is_build_output(&rel) || git::is_ignored(&root, &rel);
+                local.set(local.get() + git_started.elapsed());
+                if ignored {
+                    continue;
+                }
+                crate::prompt::note_touch(&session_id, "written", &rel, env);
+                // a subagent's write saved nothing in the parent's context
+                if let (true, Ok(meta)) = (worker.is_empty(), std::fs::metadata(target)) {
+                    crate::prompt::note_written_avoided(&session_id, &rel, meta.len(), env);
+                }
+                match std::fs::metadata(target) {
+                    Ok(meta) if meta.len() > MAX_FILE_BYTES => continue,
+                    Err(_) => continue, // a deleted file (apply_patch delete) or unreadable
+                    _ => {}
+                }
+                let Ok(bytes) = std::fs::read(target) else { continue };
+                let content = text_of_source(&bytes);
+                if budget_left().is_zero() {
+                    break;
+                }
+                let payload = payload_for(&rel, &content, &meta);
+                let response = match http::post(&cfg.server, "/report", &cfg.token, &user_agent(), &payload, budget_left()) {
+                    Ok(response) => {
+                        crate::spool::forget(env, &cfg.server, &cfg.repo_id, &root, &rel);
+                        response
+                    }
+                    // the server did not get it: owed, and sent again next run
+                    Err(()) => {
+                        crate::spool::remember(env, &cfg.server, &cfg.repo_id, &root, &rel, &meta);
+                        Value::Object(Default::default())
+                    }
+                };
+                // a lint finding stands only where this file really uses the
+                // old name or a call that no longer fits
+                let response = biting(&response, &content);
+
+                // a certain interface change: its dependents' tests run detached
+                // and grade the change on the graph; nothing of it reaches the agent
+                if let Some(plan) = response.get("verify").filter(|p| p.get("tests").and_then(Value::as_array).is_some_and(|t| !t.is_empty())) {
+                    crate::verify::spawn(&root, &session_id, plan);
+                }
+                let fix_note =
+                    apply_mechanical(&response, &root, target, &rel, &content, &cfg, &meta, budget_left());
+                // a change the pre-write gate or the protocol's push already
+                // told this session about (with the lines, arity-checked) is
+                // not said again by the name-only lint
+                let mut told_facts = crate::deps::Told::load(env, &crate::proto::agent_of(&session_id, &worker));
+                let told = told_facts.told_names();
+                // and a finding this session already heard for this file is not
+                // said again on its next edit of it: each fact once
+                let fresh = once_per_session(&strip_told(&response, &told), &rel, &root, &mut told_facts);
+                let mut lint_note = lint_context(&fresh, !fix_note.is_empty(), &root, crate::land::lands(&root, env));
+                // a break Cork named earlier in this file, that this write
+                // fixed: a catch, counted (pings.rs). A finding that names no
+                // line the change makes wrong (a renamed parameter, same
+                // arity) is no break, and counts nothing (v104's test)
+                let pending = crate::pings::pending_break(env, &session_id, &rel);
+                if !pending.is_empty() {
+                    let fixes: Vec<crate::fixlines::Fix> = pending.iter().filter_map(crate::fixlines::from_finding).collect();
+                    if crate::fixlines::render_lines(&rel, &content, &fixes).is_empty() {
+                        let by = pending.iter().map(|f| text(f, "by")).find(|b| !b.is_empty()).unwrap_or_default();
+                        crate::pings::caught(env, &root, &crate::pings::catch_line(&rel, &by, "a call a teammate's change broke, fixed"));
+                        crate::pings::clear_break(env, &session_id, &rel);
+                    }
+                }
+                // the lines of this file each finding makes wrong (fixlines.rs)
+                if !lint_note.is_empty() {
+                    let findings: Vec<Value> = fresh.get("findings").and_then(Value::as_array).cloned().unwrap_or_default();
+                    let fixes: Vec<crate::fixlines::Fix> = findings.iter().filter_map(crate::fixlines::from_finding).collect();
+                    let lines = crate::fixlines::render_lines(&rel, &content, &fixes);
+                    if !lines.is_empty() {
+                        lint_note = format!("{lint_note}\n{lines}");
+                        crate::pings::note_break(env, &session_id, &rel, &findings);
+                    }
+                }
+                let rename_note = adopt_preferred_repo_id(&response, &root, &cfg.repo_id);
+                let awareness = if context.is_empty() { awareness_context(&response) } else { context.clone() };
+                let pieces = [
+                    fix_note,
+                    lint_note,
+                    rename_note,
+                    setup_note(&response, &root),
+                    sync_note.clone(),
+                    artifacts_note(&response, &root, &cfg.server, env),
+                    retired_note(&response, &root),
+                    ask_why_note(&response),
+                    dependents_note(&response, &crate::proto::agent_of(&session_id, &worker), env),
+                    prefetch_note(&response, &session_id, env),
+                    awareness,
+                    crate::machine::inbox(&response),
+                ];
+                let mut kept: Vec<String> = Vec::new();
+                for piece in pieces.into_iter().filter(|p| !p.is_empty()) {
+                    if !kept.contains(&piece) {
+                        kept.push(piece);
+                    }
+                }
+                if !kept.is_empty() {
+                    context = kept.join("\n");
+                }
             }
-        }
-        // additionalContext lands in the agent's session: awareness arrives
-        // with the write, not at the next voluntary check
-        return emit(&context);
+            // a test run that also left files behind (`pytest 2>&1 | tail` just
+            // after an edit reads as a shell write): its verdict still counts,
+            // and it goes after the writes it judged
+            if SHELL_TOOLS.contains(&tool.as_str()) && !budget_left().is_zero() {
+                let command = text(&tool_input, "command");
+                let failed = FAILED_CALL.load(std::sync::atomic::Ordering::Relaxed);
+                if let Some(ok) = test_verdict(&command, &shell_output(&hook_input), failed) {
+                    let mut payload = meta.clone();
+                    payload.insert("repo_id".into(), json!(cfg.repo_id));
+                    payload.insert("path".into(), json!(shown_command(command.trim())));
+                    payload.insert("action".into(), json!("running"));
+                    payload.insert("tests_ok".into(), json!(ok));
+                    let _ = http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &Value::Object(payload), budget_left());
+                }
+            }
+            // additionalContext lands in the agent's session: awareness arrives
+            // with the write, not at the next voluntary check; what the protocol
+            // refused leads
+            let refused = refused.and_then(|h| h.join().ok()).unwrap_or_default();
+            emit(&crate::prompt::join_notes(&[&refused, &context]))
+        });
     }
 
     // presence only: where the agent is looking, or what it is RUNNING.
@@ -1682,14 +2611,25 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
     // into another repo is that repo's activity, not ours.
     if tool == "Bash" {
         let command = text(&tool_input, "command").trim().to_string();
+        // a plain push went through (a landing promotes its own): the
+        // session's ops on what it pushed are proven
+        if !FAILED_CALL.load(std::sync::atomic::Ordering::Relaxed) && command.contains("git push") {
+            crate::proto::promote_after_push(&root, &cfg, env, &session_id);
+        }
         if command.is_empty()
             || shell::command_leaves_repo(&command, &cwd, &root, config::get(env, "HOME"))
             || budget_left().is_zero()
         {
             return emit(&sync_note);
         }
+        // git's own trouble, as counts: a conflict, a rejected push, a revert
+        // (the waste report's baseline; posts only when there is one)
+        crate::gitsignal::observe(
+            &command, &shell_output(&hook_input), FAILED_CALL.load(std::sync::atomic::Ordering::Relaxed), &cfg, &session_id,
+            budget_left(),
+        );
         // the map's answer to the name the agent just searched for
-        let sync_note = crate::prompt::join_notes(&[&sync_note, &crate::prompt::grep_companion(&command, &cfg, budget_left(), &session_id, env)]);
+        let sync_note = crate::prompt::join_notes(&[&sync_note, &crate::prompt::grep_companion(&command, &cfg, &root, budget_left(), &session_id, !worker.is_empty(), env)]);
         // what the command DISPLAYED joins the map, the way a Read does:
         // one file as a single observation, several as a batch
         let shown: Vec<Value> = shell::shell_read_targets(&command, &cwd, &root)
@@ -1726,7 +2666,7 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
         payload.insert("repo_id".into(), json!(cfg.repo_id));
         payload.insert("path".into(), json!(shown_command(&command)));
         payload.insert("action".into(), json!("running"));
-        // the repo's tests ran here: their verdict is how Collide knows a
+        // the repo's tests ran here: their verdict is how Cork knows a
         // task's work passed, with no commit involved
         let failed = FAILED_CALL.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(ok) = test_verdict(&command, &shell_output(&hook_input), failed) {
@@ -1756,6 +2696,8 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
             if is_map_source(&inside) && !budget_left().is_zero() {
                 crate::prompt::note_touch(&session_id, "read", &inside, env);
                 if let Some(content) = source_of(&root.join(&inside)) {
+                    // what it read, the session hears about as it changes
+                    crate::proto::follow_read(env, &session_id, &root, &inside, &content);
                     let mut payload = meta.clone();
                     payload.insert("repo_id".into(), json!(cfg.repo_id));
                     payload.insert("path".into(), json!(inside));
@@ -1765,7 +2707,7 @@ fn run_event(stdin_data: &str, env: &Env) -> i32 {
                         &Value::Object(payload), budget_left(),
                     );
                     let (note, inbox) = answer
-                        .map(|a| (crate::prompt::recent_write_note(&a, &inside), crate::machine::inbox(&a)))
+                        .map(|a| (crate::prompt::recent_write_note(&a, &inside, crate::land::lands(&root, env)), crate::machine::inbox(&a)))
                         .unwrap_or_default();
                     return emit(&crate::prompt::join_notes(&[&sync_note, &note, &inbox]));
                 }
@@ -1865,23 +2807,25 @@ pub fn add_credentials(source: &str, env: &Env) -> i32 {
     0
 }
 
-const INSTALL_NOTICE: &str = "Collide: this machine has no usable hook credential for {server} \
+const INSTALL_NOTICE: &str = "Cork: this machine has no usable hook credential for {server} \
 yet, so NOTHING you edit is being reported and every teammate's collision check goes stale \
-against your work. Before any other task: call the collide MCP tool `setup` (repo_id {repo_id}), \
-save the returned user_files JSON content to a temp file, and run `{install}` — a mechanical \
-merge into ~/.collide/credentials.json that leaves other workspaces' tokens intact. One-time; \
-every edit auto-reports afterwards. Tell the human when it is done.";
+against your work. Before any other task: call the Cork MCP tool `setup` (repo_id {repo_id}) \
+and run the one install command it returns, in a shell at this repo's root. It installs Cork \
+once for every repo on this machine, signs the machine in, and retires this repo's old per-repo \
+setup (commit what it stages). Tell the human when it is done.";
 
 /// `check-credentials`: print a session-start notice when this machine cannot
 /// actually report, silent when it can. Resolves the credential exactly the
-/// way the hook does, so what it reports is what the hook will do.
-pub fn check_credentials(python_cmd: &str, env: &Env) -> i32 {
+/// way the hook does, so what it reports is what the hook will do. Run by
+/// the old per-repo setup's session-start command; the argument it passes
+/// (the program that ran it) is no longer needed.
+pub fn check_credentials(_runner: &str, env: &Env) -> i32 {
     let project_dir = config::get(env, "CLAUDE_PROJECT_DIR");
     let Some(root) = config::find_repo_root(&[
         std::env::current_dir().ok(),
         (!project_dir.is_empty()).then(|| PathBuf::from(project_dir)),
     ]) else {
-        return 0; // not a Collide repo: nothing to say
+        return 0; // not a Cork repo: nothing to say
     };
     let cfg = config::config(Some(&root), env);
     if cfg.server.is_empty() || cfg.repo_id.is_empty() {
@@ -1891,20 +2835,7 @@ pub fn check_credentials(python_cmd: &str, env: &Env) -> i32 {
     // version fetches its replacement in the background
     crate::selfupdate::spawn_if_due(&cfg.server, env);
     if cfg.token.is_empty() {
-        // when the session-start shim found the native binary it passes its
-        // own path, so the instruction names the tool that will actually run
-        let install = if python_cmd.ends_with("collide-hook") {
-            format!("{python_cmd} add-credentials <that file>")
-        } else {
-            format!("{python_cmd} .collide/report_hook.py --add-credentials <that file>")
-        };
-        println!(
-            "{}",
-            INSTALL_NOTICE
-                .replace("{server}", &cfg.server)
-                .replace("{repo_id}", &cfg.repo_id)
-                .replace("{install}", &install)
-        );
+        println!("{}", INSTALL_NOTICE.replace("{server}", &cfg.server).replace("{repo_id}", &cfg.repo_id));
     }
     0 // never disturb a session start
 }
@@ -1975,16 +2906,54 @@ mod verdict_tests {
 }
 
 #[cfg(test)]
+mod add_repo_url_tests {
+    use super::*;
+
+    #[test]
+    fn the_add_repo_page_is_on_the_site_and_names_the_app_to_go_back_to() {
+        let env = Env::new();
+        assert_eq!(
+            add_repo_url("https://mcp.corkcli.com", "github.com/lithometric/juice", "Visual Studio Code", &env),
+            "https://corkcli.com/add-repo?repo=github.com%2Flithometric%2Fjuice&from=Visual%20Studio%20Code"
+        );
+        assert_eq!(
+            add_repo_url("https://mcp.corkcli.com", "github.com/acme/api#dev", "", &env),
+            "https://corkcli.com/add-repo?repo=github.com%2Facme%2Fapi%23dev"
+        );
+        // a server with no known site opens nothing
+        assert_eq!(add_repo_url("http://127.0.0.1:8000", "github.com/acme/api", "", &env), "");
+    }
+
+    #[test]
+    fn only_a_person_at_a_new_session_is_asked_where_a_new_repo_goes() {
+        let new = json!({"new_repo": true});
+        assert!(asks_where(&new, false, false, false));
+        // headless (claude -p, codex exec, CI): nobody to ask
+        assert!(!asks_where(&new, false, false, true));
+        assert!(!asks_where(&new, false, true, false));
+        assert!(!asks_where(&new, true, false, false));
+        assert!(!asks_where(&json!({"ok": true}), false, false, false));
+    }
+
+    #[test]
+    fn codex_exec_and_claude_p_count_as_headless() {
+        let mut env = Env::new();
+        env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-cli".into());
+        assert!(crate::harness::headless(&json!({}), &env));
+        let attended = Env::new();
+        assert!(!crate::harness::headless(&json!({"source": "startup"}), &attended));
+    }
+}
+
+#[cfg(test)]
 mod settings_digest_tests {
     use super::*;
 
-    /// The digest is a handshake across three implementations: this hook, the
-    /// Python hook, and the server that decides what "current" means. The
-    /// fixture and its expected value were produced by `blocks.settings_digest`
-    /// on the Python side, so a drift in any one of them fails here rather than
+    /// The digest's exact value for a fixed settings file. Hooks already in
+    /// the field report this value, so a drift fails here rather than
     /// reporting every correct install as stale.
     #[test]
-    fn matches_the_python_digest_for_the_same_settings() {
+    fn digest_is_stable_for_the_same_settings() {
         let dir = std::env::temp_dir().join("collide-settings-digest-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
@@ -1999,7 +2968,7 @@ mod settings_digest_tests {
         assert_eq!(settings_digest(&dir.join("nowhere")), "");
     }
 
-    /// Somebody else's hooks are not ours, so merging Collide into a settings
+    /// Somebody else's hooks are not ours, so merging Cork into a settings
     /// file that already had hooks must not read as drift.
     #[test]
     fn foreign_hooks_do_not_enter_the_digest() {
@@ -2025,11 +2994,11 @@ mod dashboard_tests {
 
     #[test]
     fn the_dashboard_is_the_site_behind_the_mcp_host() {
-        assert_eq!(dashboard_url("https://mcp.collidemcp.com", &env(&[])), "https://collidemcp.com/dashboard");
+        assert_eq!(dashboard_url("https://mcp.corkcli.com", &env(&[])), "https://corkcli.com/dashboard");
         assert_eq!(dashboard_url("https://api.example.io/", &env(&[])), "https://example.io/dashboard");
         assert_eq!(dashboard_url("http://localhost:8000", &env(&[])), "");
         assert_eq!(
-            dashboard_url("http://localhost:8000", &env(&[("COLLIDE_DASHBOARD_URL", "http://localhost:3000/")])),
+            dashboard_url("http://localhost:8000", &env(&[("CORK_DASHBOARD_URL", "http://localhost:3000/")])),
             "http://localhost:3000/dashboard"
         );
     }
@@ -2038,10 +3007,10 @@ mod dashboard_tests {
     fn no_browser_in_ci_over_ssh_or_when_turned_off() {
         let desktop = [("DISPLAY", ":0")];
         assert!(may_open_browser(&env(&desktop)));
-        for (key, value) in [("CI", "true"), ("SSH_CONNECTION", "1 2 3 4"), ("COLLIDE_NO_BROWSER", "1"), ("PYTEST_CURRENT_TEST", "x")] {
+        for (key, value) in [("CI", "true"), ("SSH_CONNECTION", "1 2 3 4"), ("CORK_NO_BROWSER", "1"), ("PYTEST_CURRENT_TEST", "x")] {
             assert!(!may_open_browser(&env(&[desktop[0], (key, value)])), "{key}");
         }
-        assert!(may_open_browser(&env(&[desktop[0], ("COLLIDE_NO_BROWSER", "0")])));
+        assert!(may_open_browser(&env(&[desktop[0], ("CORK_NO_BROWSER", "0")])));
     }
 }
 
@@ -2070,8 +3039,10 @@ mod redact_tests {
 
 
 /// Hand a "this command has started" note to a detached copy of this
-/// program (`started <cwd> <session> <command>`): the gate returns at once.
-pub fn spawn_started(cwd: &Path, session: &str, command: &str, transcript: &str) {
+/// program (`started <cwd> <session> <command> <transcript> <worker>
+/// <worker_type>`): the gate returns at once. A subagent's command carries
+/// the subagent (`worker`, the hook input's agent_id) and its type.
+pub fn spawn_started(cwd: &Path, session: &str, command: &str, transcript: &str, worker: &str, worker_type: &str) {
     let command = command.trim();
     if command.is_empty() {
         return;
@@ -2084,6 +3055,8 @@ pub fn spawn_started(cwd: &Path, session: &str, command: &str, transcript: &str)
         .arg(session)
         .arg(shown_command(command))
         .arg(transcript)
+        .arg(worker)
+        .arg(worker_type)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -2095,7 +3068,7 @@ pub fn spawn_started(cwd: &Path, session: &str, command: &str, transcript: &str)
     let _ = child.spawn();
 }
 
-/// `started <cwd> <session> <command>`: tell Collide the agent is running
+/// `started <cwd> <session> <command>`: tell Cork the agent is running
 /// this command now. Silent, short budget, nothing printed.
 pub fn started_command(args: &[String], env: &Env) -> i32 {
     let (Some(cwd), Some(session), Some(command)) = (args.get(1), args.get(2), args.get(3)) else { return 0 };
@@ -2107,15 +3080,79 @@ pub fn started_command(args: &[String], env: &Env) -> i32 {
     let mut payload = json!({"repo_id": cfg.repo_id, "session": session, "path": command, "action": "running", "started": true});
     // the model, so a new repo's dashboard knows whose agent this is from
     // its first command, not only once one finishes
-    if let Some(model) = args.get(4).map(|t| transcript::turn_meta(t)).and_then(|m| m.get("model").and_then(Value::as_str).map(str::to_string)).filter(|m| !m.is_empty()) {
+    let meta = args.get(4).map(|t| transcript::turn_meta_in(t, env)).unwrap_or_default();
+    if let Some(model) = meta.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()) {
         payload["model"] = json!(model);
+        if let Some(map) = payload.as_object_mut() {
+            transcript::copy_mode(&meta, map);
+        }
     }
     let branch = git::branch(&root);
     if !branch.is_empty() {
         payload["branch"] = json!(branch);
     }
+    if let Some(map) = payload.as_object_mut() {
+        add_ide(map, &root, env);
+    }
+    add_started_worker(&mut payload, args);
     let _ = http::post(&cfg.server, "/presence", &cfg.token, &user_agent(), &payload, Duration::from_secs(5));
     0
+}
+
+/// A command a subagent started names it, as every other post does:
+/// `worker` (its agent_id), `worker_type`, and `worker_name` (what it was
+/// started with, from the transcript) when known.
+fn add_started_worker(payload: &mut Value, args: &[String]) {
+    let worker = args.get(5).map(|w| w.trim()).unwrap_or("");
+    if worker.is_empty() {
+        return;
+    }
+    payload["worker"] = json!(worker);
+    let worker_type = args.get(6).map(|t| t.trim()).unwrap_or("");
+    if !worker_type.is_empty() {
+        payload["worker_type"] = json!(worker_type);
+    }
+    let name = transcript::worker_name(args.get(4).map(String::as_str).unwrap_or(""), worker);
+    if !name.is_empty() {
+        payload["worker_name"] = json!(name);
+    }
+}
+
+#[cfg(test)]
+mod started_worker_tests {
+    use super::*;
+
+    #[test]
+    fn a_subagents_command_names_the_subagent() {
+        let args: Vec<String> = ["started", "/repo", "s1", "npm test", "", "agent-7", "Explore"].iter().map(|s| s.to_string()).collect();
+        let mut payload = json!({"action": "running"});
+        add_started_worker(&mut payload, &args);
+        assert_eq!(payload["worker"], "agent-7");
+        assert_eq!(payload["worker_type"], "Explore");
+        // the main agent's command: no worker fields
+        let args: Vec<String> = ["started", "/repo", "s1", "npm test", "", "", ""].iter().map(|s| s.to_string()).collect();
+        let mut payload = json!({"action": "running"});
+        add_started_worker(&mut payload, &args);
+        assert!(payload.get("worker").is_none() && payload.get("worker_type").is_none());
+    }
+
+    #[test]
+    fn the_subagents_name_comes_from_its_transcript() {
+        let dir = std::env::temp_dir().join(format!("collide-started-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let transcript = dir.join("sess.jsonl");
+        let sub = dir.join("sess").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        std::fs::write(sub.join("agent-agent-7.meta.json"), r#"{"description": "Run the billing tests"}"#).unwrap();
+        let args: Vec<String> = ["started", "/repo", "s1", "npm test", &transcript.to_string_lossy(), "agent-7", "general-purpose"]
+            .iter().map(|s| s.to_string()).collect();
+        let mut payload = json!({});
+        add_started_worker(&mut payload, &args);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(payload["worker_name"], "Run the billing tests");
+        assert_eq!(payload["worker_type"], "general-purpose");
+    }
 }
 
 #[cfg(test)]
@@ -2159,8 +3196,97 @@ mod index_choice_tests {
         assert_eq!(all, vec!["app/a.py", "app/b.py", "crm/packages/x.py", "crm/packages/y.py"], "vendored, generated and linguist-vendored files are skipped");
 
         let mut capped = Env::new();
-        capped.insert("COLLIDE_INDEX_MAX_FILES".into(), "2".into());
+        capped.insert("CORK_INDEX_MAX_FILES".into(), "2".into());
         assert_eq!(index_candidates(&dir, &capped), vec!["app/b.py", "crm/packages/x.py"], "past the cap, the recent work first");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod told_lint_tests {
+    use super::*;
+
+    /// What the pre-write gate or the protocol's push already said is not
+    /// said again by the report's name-only lint; anything else still is.
+    #[test]
+    fn the_lint_leaves_out_what_the_session_was_told() {
+        let response = json!({"findings": [
+            {"rule": "signature_drift", "symbol": "compute_tax", "lines": [1, 6], "fix": {"class": "judgment", "prompt": "verify"}},
+            {"rule": "stale_name", "symbol": "rate_for", "renamed_to": "rate_of", "lines": [2], "fix": {"class": "mechanical"}},
+            {"rule": "removed_symbol_use", "symbol": "Cart.total", "lines": [9], "fix": {"class": "judgment", "prompt": "find it"}},
+        ]});
+        let told: std::collections::BTreeSet<(String, String)> =
+            [("compute_tax".to_string(), "sig".to_string()), ("total".to_string(), "del".to_string())].into();
+        let kept = strip_told(&response, &told);
+        let rules: Vec<String> = kept["findings"].as_array().unwrap().iter().map(|f| text(f, "rule")).collect();
+        assert_eq!(rules, vec!["stale_name".to_string()]);
+        assert_eq!(strip_told(&response, &Default::default()), response, "nothing told: the lint as it was");
+    }
+
+    /// Lattice test, round 2 (v104): `pickLabels(anchor, opts)` had become
+    /// `pickLabels(anchor, opts)` with renamed parameters 14 hours before,
+    /// and every call already fit; the lint said "changed its signature" on
+    /// each edit. A finding stands only where the file bears it out.
+    #[test]
+    fn a_finding_the_file_does_not_bear_out_is_dropped() {
+        let content = "import { pickLabels, openMenu } from '../menu.js';\n\
+pickLabels(anchor, { current, onPick });\nopenMenu(el, items);\nconst cur = issue();\n";
+        let response = json!({"findings": [
+            {"rule": "signature_drift", "symbol": "pickLabels", "signature": "export function pickLabels(anchor, opts)", "lines": [1, 2]},
+            {"rule": "signature_drift", "symbol": "openMenu", "signature": "export function openMenu(anchor, items, opts = {})", "lines": [3]},
+            {"rule": "signature_drift", "symbol": "openMenu", "signature": "", "lines": [3]},
+            {"rule": "stale_name", "symbol": "cur", "renamed_to": "current", "lines": [4]},
+            {"rule": "stale_name", "symbol": "pickPriority", "renamed_to": "choosePriority", "lines": [9]},
+            {"rule": "signature_drift", "symbol": "pickEstimate", "signature": "export function pickEstimate(a, b, c)", "lines": [2]},
+        ]});
+        let kept = biting(&response, content);
+        let kept: Vec<(String, String)> =
+            kept["findings"].as_array().unwrap().iter().map(|f| (text(f, "rule"), text(f, "symbol"))).collect();
+        // `openMenu(el, items)` fits 2-3 params; `pickLabels(anchor, {...})` fits 2;
+        // no signature to check against; `cur` is used; `pickPriority` and
+        // `pickEstimate` are not in the file
+        assert_eq!(kept, vec![("stale_name".to_string(), "cur".to_string())]);
+        // a call that no longer fits still stands
+        let tight = json!({"findings": [{"rule": "signature_drift", "symbol": "openMenu", "signature": "function openMenu(anchor, items, opts, more)", "lines": [3]}]});
+        assert_eq!(biting(&tight, content)["findings"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod pr_badge_tests {
+    use super::*;
+
+    /// A harness whose hooks cannot add the badge (Cursor, Hermes) asks the
+    /// agent to end its pull requests with the line, unless the person said
+    /// `cork badge off` or set `CORK_PR_BADGE=0`; where the hooks add it
+    /// (Claude Code, Codex) the agent is not asked.
+    #[test]
+    fn the_badge_line_is_asked_for_only_where_the_hooks_cannot_add_it() {
+        let home = std::env::temp_dir().join(format!("cork-pr-badge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut env = Env::new();
+        env.insert("HOME".into(), home.to_string_lossy().to_string());
+        env.insert("CORK_HOME".into(), home.to_string_lossy().to_string());
+        let asked = |env: &Env| on_here_line(env, "cursor").contains(crate::machine::PR_BADGE_LINE);
+        let line = on_here_line(&env, "cursor");
+        assert!(line.starts_with("Cork is on here.") && !line.contains('\n'), "{line}");
+        assert!(line.ends_with("after any other attribution lines: [![coordinated by cork](https://corkcli.com/badge.svg)](https://corkcli.com)"), "{line}");
+        assert!(asked(&env) && on_here_line(&env, "hermes").contains(crate::machine::PR_BADGE_LINE));
+        for covered in ["claude", "codex"] {
+            let line = on_here_line(&env, covered);
+            assert!(line.starts_with("Cork is on here.") && !line.contains("pull request"), "{covered}: {line}");
+        }
+        // `cork badge off`, kept in machine.json beside what is there
+        crate::machine::save_settings(&env, &json!({"mode": "local"}));
+        assert_eq!(crate::machine::badge(&["off".to_string()], &env), 0);
+        assert!(!asked(&env));
+        assert_eq!(crate::machine::settings(&env)["mode"], "local");
+        assert_eq!(crate::machine::badge(&["on".to_string()], &env), 0);
+        assert!(asked(&env));
+        // the environment switch, whatever the file says
+        env.insert("CORK_PR_BADGE".into(), "0".into());
+        assert!(!asked(&env));
+        assert!(on_here_line(&env, "cursor").starts_with("Cork is on here."));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

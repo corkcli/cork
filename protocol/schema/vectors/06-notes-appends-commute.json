@@ -1,0 +1,150 @@
+{
+  "name": "Notes: concurrent appends commute",
+  "description": "append x append = commute. Alice and Bob append to the same note from version 0; both land, and Bob is told what he was rebased over.",
+  "steps": [
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "alice-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "bob-1",
+        "agent_id": "codex-b",
+        "person": "bob@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "bob-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 1,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.1",
+        "key": "note:standup",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "append",
+        "payload": "LSBzaGlwcGVkIHRoZSBwYXJzZXIK",
+        "hlc": {
+          "w": 1,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "at": 1,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.1",
+        "key": "note:standup",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "append",
+        "payload": "LSByZXZpZXdpbmcgIzQyCg==",
+        "hlc": {
+          "w": 1,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "ack",
+            "version": 2,
+            "rebased_over": [
+              {
+                "op_id": "alice-1.1",
+                "kind": "append",
+                "payload": "LSBzaGlwcGVkIHRoZSBwYXJzZXIK"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 2,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.2",
+        "key": "note:standup",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "edit_text",
+        "payload": "cmV3cml0dGVu",
+        "hlc": {
+          "w": 2,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "reject",
+            "reason": "conflict",
+            "theirs": [
+              {
+                "op_id": "alice-1.1"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

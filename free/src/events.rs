@@ -7,10 +7,8 @@
 //! within one tool call of it happening rather than at its next voluntary
 //! check.
 //!
-//! One caveat worth stating plainly: this writes the durable ring, which is
-//! what deltas and the dashboard's polling read. It does NOT reach the Python
-//! half's in-process websocket subscribers. While both servers run, an
-//! endpoint must be served by exactly one of them.
+//! This writes the durable ring, which is what deltas and the dashboard's
+//! polling read.
 
 use serde_json::{json, Map, Value};
 
@@ -188,7 +186,7 @@ you; don't wait on its in-flight work"),
 /// for a person wins, then that person's claimed username, then the email's
 /// local part. Nicknames are private to the caller.
 fn identity_labels(store: &Store, caller: &str, users: &[String]) -> Map<String, Value> {
-    let nicks = store.kv_get("nicknames", caller).unwrap_or(Value::Null);
+    let nicks = crate::access::nicknames_of(store, caller);
     let mut out = Map::new();
     for user in users {
         let username = store
@@ -283,7 +281,7 @@ pub fn deltas_for(store: &Store, scope: &str, user_id: &str) -> Option<Vec<Value
     Some(out)
 }
 
-/// Attach `since_your_last_call` to a response, exactly as the Python half does.
+/// Attach `since_your_last_call` to a response.
 pub fn with_deltas(store: &Store, scope: &str, user_id: &str, mut response: Value) -> Value {
     if let Some(deltas) = deltas_for(store, scope, user_id) {
         if let Some(map) = response.as_object_mut() {

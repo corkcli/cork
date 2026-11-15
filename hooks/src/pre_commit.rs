@@ -27,7 +27,7 @@ const LANGUAGE_ALLOWLIST: [&str; 16] = [
 ];
 
 /// Paths staged for this commit (added/copied/modified/renamed), filtered to
-/// the language allowlist — repo-relative, exactly how Collide keys them.
+/// the language allowlist — repo-relative, exactly how Cork keys them.
 fn staged_files(root: &Path) -> Vec<String> {
     let Ok(output) = Command::new("git")
         .args(["-C"])
@@ -107,7 +107,7 @@ pub fn run(env: &Env) -> (i32, String) {
     (
         1,
         format!(
-            "Collide blocked this commit — {} staged file(s) collide with in-flight work:\n\
+            "Cork blocked this commit — {} staged file(s) collide with in-flight work:\n\
 {listing}\n\
 Reconcile with the latest names/signatures (check_collisions), then re-commit. To override a \
 false positive: git commit --no-verify\n",

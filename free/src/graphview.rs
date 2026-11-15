@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use collide_core::graph as core_graph;
+use cork_core::graph as core_graph;
 use serde_json::{json, Value};
 
 use crate::codegraph::FileRecord;
@@ -127,8 +127,8 @@ pub struct EdgeData {
 }
 
 /// A directed graph with the few operations the reductions need. Parallel
-/// edges collapse, which is what the Python side's DiGraph does too: a second
-/// edge between the same pair replaces the first rather than adding to it.
+/// edges collapse: a second edge between the same pair replaces the first
+/// rather than adding to it.
 #[derive(Default)]
 pub struct Snapshot {
     pub nodes: BTreeMap<String, NodeData>,
@@ -205,15 +205,14 @@ fn records(store: &Store, scope: &str) -> BTreeMap<String, Arc<FileRecord>> {
         .collect()
 }
 
-/// Identifies a file set at given timestamps. Python builds it over sorted
-/// paths, and a BTreeMap is already sorted.
+/// Identifies a file set at given timestamps, over sorted paths (a BTreeMap
+/// is already sorted).
 fn fingerprint(records: &BTreeMap<String, Arc<FileRecord>>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for (path, record) in records {
-        // serde_json writes a float the way Python's str() does, which the
-        // chain hash already depends on — the same agreement is what makes
-        // this fingerprint comparable across the two servers
+        // serde_json's float rendering, which the chain hash already
+        // depends on, keeps this fingerprint stable
         let ts = serde_json::to_string(&json!(record.ts)).unwrap_or_else(|_| "0.0".into());
         hasher.update(format!("{path}:{ts}\n").as_bytes());
     }
@@ -847,7 +846,7 @@ pub struct HubLists {
 /// suite.
 ///
 /// Test scaffolding depends on everything and ships nothing, so left in it
-/// wins the ranking outright: on Collide's own map five of the six most
+/// wins the ranking outright: on Cork's own map five of the six most
 /// depended-on symbols were fixtures. So the default list is product symbols
 /// ranked by the dependents that are themselves product code, and the test
 /// suite gets its own list rather than being deleted from the answer.
@@ -981,7 +980,7 @@ pub fn communities(
     let parts = if edges.is_empty() {
         isolated.iter().map(|nid| vec![nid.clone()]).collect()
     } else {
-        collide_core::community::louvain(&edges, LOUVAIN_RESOLUTION, LOUVAIN_SEED, &isolated)
+        cork_core::community::louvain(&edges, LOUVAIN_RESOLUTION, LOUVAIN_SEED, &isolated)
     };
 
     let mut out: Vec<Community> = Vec::new();
@@ -1000,8 +999,7 @@ pub fn communities(
             }
             *dirs.entry(dir).or_insert(0) += 1;
         }
-        // most members wins; ties go to the directory seen first, which is
-        // what Python's Counter does
+        // most members wins; ties go to the directory seen first
         let top_dir = dir_order
             .iter()
             .max_by_key(|dir| (dirs[*dir], std::cmp::Reverse(dir_order.iter().position(|d| d == *dir))))
@@ -1112,7 +1110,7 @@ pub fn name_communities(comms: &mut [Community]) {
 
 // --------------------------------------------------------------- overlays
 
-/// What makes this Collide's graph rather than a static map: who owns each
+/// What makes this Cork's graph rather than a static map: who owns each
 /// region, what is leased right now, and what was tried and settled there.
 #[derive(Default)]
 pub struct Overlays {
@@ -1122,9 +1120,9 @@ pub struct Overlays {
     pub memories: BTreeMap<String, MemorySlot>,
     pub breaking: BTreeMap<String, Value>,
     /// The order each map was discovered in. Ties in every ranking below fall
-    /// back to it, because the Python side's dicts preserve insertion order
-    /// and a stable sort leaves equal elements in it — sorting ties by name
-    /// instead would be just as deterministic and disagree on every one.
+    /// back to it: a stable sort leaves equal elements in discovery order —
+    /// sorting ties by name instead would be just as deterministic and less
+    /// meaningful.
     pub in_flight_order: Vec<String>,
     pub breaking_order: Vec<String>,
     /// An episode COUNT, so it is serialised as the integer it is. Only the
@@ -1298,8 +1296,7 @@ pub const PRESSURE_HISTORY_DIV: f64 = 4.0;
 /// close the others are on the graph (a dependent one hop out weighs 0.6, two
 /// hops 0.3), how long the claims have sat without an edit landing, and how
 /// often the file has collided before. `1 - exp(-crowd * staleness * history
-/// / 2)`, rounded to two decimals, computed identically by Python's
-/// `pressure_from_intents` so both halves colour the same squares. Red on the
+/// / 2)`, rounded to two decimals. Red on the
 /// grid stays for a change that actually broke an interface; this is the
 /// yellow that builds before one does.
 pub fn pressure_from_intents(
@@ -1780,8 +1777,7 @@ pub fn overlays_for(
         breaking_order,
         co_change: if co_change { co_change_from_rows(&rows) } else { BTreeMap::new() },
         // unconditional, like `owners`: one more pass over rows already in
-        // hand. Only `to_graphify` reads it, so the maps that do not ask for
-        // it on the Python side are unchanged by having it here.
+        // hand. Only `to_graphify` reads it.
         touches: touches_from_rows(&rows),
     }
 }
@@ -1798,7 +1794,7 @@ const BLAST_CALLS: usize = 6;
 
 /// Whether a call site `[name, line, args]` uses `target` (a node id): it
 /// calls the symbol, or its arguments name it (`money(order.total)` uses
-/// `Order`). Twin of graph.py's `_call_uses`.
+/// `Order`).
 fn call_uses(site: &Value, target: &str) -> bool {
     let symbol = target.rsplit("::").next().unwrap_or("");
     let short = symbol.rsplit('.').next().unwrap_or(symbol);
@@ -2030,7 +2026,6 @@ pub const VERIFY_BUDGET_S: f64 = 240.0;
 ///
 /// Zero model tokens by design: the agent reads nothing and is told nothing
 /// extra; the tests run detached on its machine, like the repo's check.
-/// Python's `verify_plan`.
 pub fn verify_plan(graph: &Snapshot, path: &str, hot_events: &[Value]) -> Value {
     let file_node = find_node(graph, path, "");
     let path_of = |nid: &str| graph.nodes.get(nid).map(|d| d.path.clone()).unwrap_or_default();
@@ -2098,7 +2093,7 @@ pub fn verify_plan(graph: &Snapshot, path: &str, hot_events: &[Value]) -> Value 
 
 /// The marker's `verified` the moment the change lands: clear when nothing
 /// depends on it, partial when something does but no test reaches it,
-/// pending when there are tests to run. Python's `verification_at_report`.
+/// pending when there are tests to run.
 pub fn verification_at_report(plan: &Value, now: f64) -> Value {
     let empty = |key: &str| plan.get(key).and_then(Value::as_array).map_or(true, |a| a.is_empty());
     if empty("dependents") {
@@ -2111,8 +2106,7 @@ pub fn verification_at_report(plan: &Value, now: f64) -> Value {
 }
 
 /// The marker's `verified` from what the hook ran: failing beats partial
-/// beats clear; a run that ran out of time proves nothing. Python's
-/// `verification_from_run`.
+/// beats clear; a run that ran out of time proves nothing.
 pub fn verification_from_run(run: &Value, now: f64) -> Value {
     let strings = |key: &str| -> Vec<String> {
         run.get(key)
@@ -2179,7 +2173,7 @@ pub fn distinct_breaking(breaking: &BTreeMap<String, Value>, order: &[String]) -
 // ----------------------------------------------------------------- export
 
 /// Graphify's `graph.json` shape, so its viewer, Obsidian export and query
-/// tooling can read a Collide graph — and so the dashboard has one payload
+/// tooling can read a Cork graph — and so the dashboard has one payload
 /// with the structure and every overlay on it.
 ///
 /// Confidence is spelled the way Graphify spells it: EXTRACTED when the
@@ -2274,7 +2268,7 @@ pub fn to_graphify(
 
     json!({
         "metadata": {
-            "generator": "collide", "repo": repo_id,
+            "generator": "cork", "repo": repo_id,
             "generated_at": crate::store::now(),
             "fingerprint": graph.fingerprint,
             "files": graph.files,
@@ -2291,7 +2285,7 @@ pub fn to_graphify(
 
 // --------------------------------------------------------- other exports
 
-/// Python's `xml.etree.ElementTree` text-content escape: `&`, `<`, `>` only.
+/// XML text-content escape: `&`, `<`, `>` only.
 fn xml_escape_text(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -2311,8 +2305,7 @@ fn xml_escape_attr(value: &str) -> String {
 }
 
 /// GraphML for Gephi/yEd, matching networkx's `generate_graphml(out)` output
-/// byte for byte — `to_graphml` in `graph.py` builds a throwaway `DiGraph`
-/// with exactly five node attributes (`label`, `kind`, `path`, `language`,
+/// byte for byte for this schema: exactly five node attributes (`label`, `kind`, `path`, `language`,
 /// `community`) added in that kwarg order and two edge attributes (`kind`,
 /// `confidence`), always in that order, and nothing else. networkx's writer
 /// assigns key ids `dN` in first-seen (name, type, scope) order — nodes
@@ -2324,14 +2317,8 @@ fn xml_escape_attr(value: &str) -> String {
 /// any) — so the key block can be built directly instead of re-deriving
 /// networkx's bookkeeping.
 ///
-/// Node/edge ORDER: `to_graphify` already iterates `graph.nodes`/`graph.out`
-/// in the `Snapshot`'s sorted (BTreeMap) order rather than Python's true
-/// insertion order; this reuses the same order for consistency. The two can
-/// disagree on a repo with nested paths (Python's node order follows
-/// `kv_list`'s `ORDER BY key` over `path.replace("/", "|")`, not a sort of
-/// `path` itself) — see the module note on `records()`. Every `<key>` and
-/// every `<data>` value still matches exactly; only the sequence of
-/// `<node>`/`<edge>` elements in the file can differ.
+/// Node/edge ORDER: the `Snapshot`'s sorted (BTreeMap) order, the same
+/// order `to_graphify` iterates in.
 pub fn to_graphml(graph: &Snapshot, comms: &[Community]) -> String {
     let mut community_of: BTreeMap<&String, i64> = BTreeMap::new();
     for community in comms {
@@ -2416,12 +2403,9 @@ pub fn to_graphml(graph: &Snapshot, comms: &[Community]) -> String {
     lines.join("\n")
 }
 
-/// Python's `json.dumps(str(value))` — the exact escaping `to_cypher` wraps
-/// every property value in. `serde_json::to_string` will not do here: Python
-/// defaults to `ensure_ascii=True`, which escapes every character outside
-/// printable ASCII as `\uXXXX` (a surrogate pair above U+FFFF); serde's
-/// output is raw UTF-8. A symbol or path with an accented letter or emoji
-/// would otherwise serialize to different bytes on the two servers.
+/// The escaping `to_cypher` wraps every property value in: a JSON string
+/// with every character outside printable ASCII as `\uXXXX` (a surrogate
+/// pair above U+FFFF), where `serde_json::to_string` would emit raw UTF-8.
 fn cypher_str(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -2467,7 +2451,7 @@ pub fn to_cypher(graph: &Snapshot, comms: &[Community]) -> String {
     }
 
     let mut lines = vec![
-        "// Collide code graph — MERGE is idempotent; re-run after every export".to_string(),
+        "// Cork code graph — MERGE is idempotent; re-run after every export".to_string(),
         "CREATE CONSTRAINT collide_node_id IF NOT EXISTS FOR (n:CollideNode) REQUIRE n.id IS UNIQUE;"
             .to_string(),
     ];
@@ -2507,7 +2491,7 @@ pub fn to_cypher(graph: &Snapshot, comms: &[Community]) -> String {
 /// Anything live — a breaking change or something in its blast radius —
 /// survives the cap regardless of degree. Trimming the one thing the view
 /// exists to show would be the wrong economy.
-/// The grid's per-square flags, one bit each — Python's `GRID_*` in graph.py.
+/// The grid's per-square flags, one bit each.
 pub const GRID_BREAKING: i64 = 1;
 pub const GRID_AT_RISK_NEAR: i64 = 2;
 pub const GRID_AT_RISK_FAR: i64 = 4;
@@ -2527,13 +2511,13 @@ pub const GRID_CLAIM_CLASH: i64 = 256;
 /// `nodes` are `[id, community (-1 = none), touches, flags, language]`,
 /// `links` are `[from, to]` indexes into `nodes` meaning "from depends on to"
 /// (code edges only; co-change is a different kind of fact and stays on the
-/// force graph's payload). Both lists are sorted, so the two halves answer
-/// byte for byte. Python's `codegraph.grid_view`, from the same snapshot,
-/// overlays and communities the force graph is built from.
+/// force graph's payload). Both lists are sorted, so the answer is stable.
+/// Built from the same snapshot, overlays and communities the force graph
+/// is built from.
 /// The grid's heat window, in days. The force graph shaded by a month of
 /// touches; at a busy repo's pace that painted four squares in five green,
 /// which says nothing. A week is the owner's call (2026-09-23): a day made
-/// the grid forget yesterday's work. Python's `GRID_HEAT_DAYS`.
+/// the grid forget yesterday's work.
 pub const GRID_HEAT_DAYS: f64 = 7.0;
 
 pub fn grid_view(store: &Store, scope: &str, repo_id: &str, idle_after_s: f64) -> Value {
@@ -2559,7 +2543,7 @@ pub fn grid_view(store: &Store, scope: &str, repo_id: &str, idle_after_s: f64) -
 
 /// Claims on the grid: a filled claim's symbols light up for a day, a
 /// clashing file's until it is renamed away, and the live claims ride along
-/// for the dashboard's list. Python's `grid_with_claims`.
+/// for the dashboard's list.
 pub fn with_claims(store: &Store, scope: &str, grid: &mut Value) {
     let (filled, clashing) = crate::claims::grid_paths(store, scope);
     if let Some(nodes) = grid.get_mut("nodes").and_then(Value::as_array_mut) {
@@ -3007,8 +2991,7 @@ pub fn path_view(
 /// whose blast radii touch the same files are one group (two agents there
 /// would collide, and one already has the context), and units that are the
 /// same transform on the same symbol are one group (six call sites needing
-/// the same change is one agent doing six ops). Python: service.plan_work —
-/// same output, byte for byte.
+/// the same change is one agent doing six ops).
 pub fn plan_work_view(graph: &Snapshot, overlays: &Overlays, units: &[Value], depth: usize) -> Value {
     let depth = depth.clamp(1, 6);
     let units: Vec<&Value> = units.iter().filter(|u| u.is_object()).collect();
@@ -3108,7 +3091,7 @@ mod tests {
             "server/tests/test_graph.py",
             "src/app/test_routes.py",
             "pkg/thing_test.go",
-            "server/collide-rs/tests/smoke.rs",
+            "server/cork-rs/tests/smoke.rs",
             "crates/x/src/store_test.rs",
             "spec/models/user_spec.rb",
             "app/models/user_spec.rb",
@@ -3123,10 +3106,10 @@ mod tests {
         }
         // the lookalikes: a name that merely CONTAINS "test" is not a test
         for path in [
-            "server/collide-rs/src/store.rs",
+            "server/cork-rs/src/store.rs",
             "src/collide/contest.py",
             "web/src/latest.ts",
-            "server/collide-rs/src/manifest.rs",
+            "server/cork-rs/src/manifest.rs",
             "nextjs-app/src/app/collide/MapPanel.tsx",
             "pkg/attestation.go",
         ] {
@@ -3234,7 +3217,7 @@ mod patch_tests {
         for seed in 1..=40u64 {
             let db = Store::open(std::path::Path::new(":memory:")).unwrap();
             let scope = format!("w:r{seed}");
-            let mut rng = Rng(seed * 0x9E3779B97F4A7C15);
+            let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15));
             let mut stamp = 1_000.0;
             // a starting tree of five files, then edits; now and then a new file
             for path in &FILES[..5] {
@@ -3253,5 +3236,33 @@ mod patch_tests {
                 assert_eq!(patched.fingerprint, full.fingerprint);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod co_change_ported_tests {
+    use super::*;
+    use crate::store::LedgerRow;
+
+    fn row(ts: f64, payload: Value) -> LedgerRow {
+        LedgerRow { seq: 0, kind: "edit_reported".into(), payload, ts }
+    }
+
+    #[test]
+    fn symbols_edited_under_one_intent_are_paired_and_owned() {
+        let rows = vec![
+            row(10.0, json!({"user": "alice", "path": "a.py", "intent_id": "i1", "symbols_changed": {"f": {}, "g": {}}})),
+            row(11.0, json!({"user": "alice", "path": "b.py", "intent_id": "i1", "symbols_changed": {"h": {}}})),
+            row(9999.0, json!({"user": "bob", "path": "c.py", "session": "s9", "symbols_changed": {"z": {}}})),
+        ];
+        let pairs = co_change_from_rows(&rows);
+        assert_eq!(pairs.get(&("a.py::f".to_string(), "a.py::g".to_string())), Some(&1));
+        assert_eq!(pairs.get(&("a.py::f".to_string(), "b.py::h".to_string())), Some(&1));
+        // alone in its episode
+        assert!(!pairs.keys().any(|(a, b)| a == "c.py::z" || b == "c.py::z"));
+
+        let owners = ownership_from_rows(&rows);
+        assert_eq!(owners["a.py::f"], vec![("alice".to_string(), 1)]);
+        assert_eq!(owners["c.py::z"], vec![("bob".to_string(), 1)]);
     }
 }

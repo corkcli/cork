@@ -1,0 +1,213 @@
+{
+  "name": "A signature change reaches the callers' subscribers at once",
+  "description": "route -> handler -> query. Carol watches route with depth 2; Bob watches handler with depth 0. Alice changes query's signature: Carol hears it through two hops, Bob (depth 0) does not; Bob hears his own key.",
+  "steps": [
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "alice-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "bob-1",
+        "agent_id": "codex-b",
+        "person": "bob@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "bob-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "carol",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "carol-1",
+        "agent_id": "claude-c",
+        "person": "carol@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "carol",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "carol-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "graph": [
+        [
+          "acme/api",
+          "code:src/api.py::handler",
+          "code:src/db.py::query"
+        ],
+        [
+          "acme/api",
+          "code:src/api.py::route",
+          "code:src/api.py::handler"
+        ]
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "carol",
+      "send": {
+        "t": "subscribe",
+        "keys": [
+          "code:src/api.py::route"
+        ],
+        "depth": 2
+      },
+      "expect": []
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "subscribe",
+        "keys": [
+          "code:src/api.py::handler"
+        ],
+        "depth": 0
+      },
+      "expect": []
+    },
+    {
+      "at": 5,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.1",
+        "key": "code:src/db.py::query",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "signature_change",
+        "public": {
+          "new_signature": "(sql, params, timeout)"
+        },
+        "hlc": {
+          "w": 5,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "version": 1
+          }
+        },
+        {
+          "conn": "carol",
+          "recv": {
+            "t": "delta",
+            "op": {
+              "op_id": "alice-1.1",
+              "kind": "signature_change",
+              "public": {
+                "new_signature": "(sql, params, timeout)"
+              }
+            },
+            "via": [
+              "code:src/api.py::route",
+              "code:src/api.py::handler",
+              "code:src/db.py::query"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 6,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.2",
+        "key": "code:src/api.py::handler",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "modify_body",
+        "hlc": {
+          "w": 6,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "version": 1
+          }
+        },
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "delta",
+            "op": {
+              "op_id": "alice-1.2"
+            }
+          }
+        },
+        {
+          "conn": "carol",
+          "recv": {
+            "t": "delta",
+            "op": {
+              "op_id": "alice-1.2"
+            },
+            "via": [
+              "code:src/api.py::route",
+              "code:src/api.py::handler"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

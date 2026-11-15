@@ -34,7 +34,7 @@ const AGENT: &str = "collide-hook/apply";
 /// it with `--recipe ID --at <its target>` and no ops at all.
 pub fn run_args(args: &[String], env: &Env) -> i32 {
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{}", json!({"_result": "USAGE", "usage": "collide-hook apply [--recipe ID] [--at PATH::SYMBOL] [--save-recipe NAME] '<op | [ops]>' (or the ops on stdin via a quoted heredoc). Ops: add_param{path,symbol,name,call_arg?,type?,default?} · pass_arg{path,symbol,arg,in:[prefixes],optional?} · rename{symbol,new_name} · remove_param{path,symbol,name} · replace_body{path,symbol,body} (the body text, no signature; the parser keeps the indentation). With --at, ops may use $target / $target.path for the named symbol and $caller / $caller.path for each function that calls it. --recipe replays a saved template with no ops. The batch is computed, written, verified with the repo check (restored on failure), declared and reported in this one call; the output's first field `_result` says OK or REFUSED."}));
+        println!("{}", json!({"_result": "USAGE", "usage": "cork apply [--recipe ID] [--at PATH::SYMBOL] [--save-recipe NAME] '<op | [ops]>' (or the ops on stdin via a quoted heredoc). Ops: add_param{path,symbol,name,call_arg?,type?,default?} · pass_arg{path,symbol,arg,in:[prefixes],optional?} · rename{symbol,new_name} · remove_param{path,symbol,name} · replace_body{path,symbol,body} (the body text, no signature; the parser keeps the indentation). With --at, ops may use $target / $target.path for the named symbol and $caller / $caller.path for each function that calls it. --recipe replays a saved template with no ops. The batch is computed, written, verified with the repo check (restored on failure), declared and reported in this one call; the output's first field `_result` says OK or REFUSED."}));
         return 0;
     }
     let mut recipe = String::new();
@@ -151,7 +151,7 @@ fn run_with(arg: &str, recipe: &str, at: &str, save: &str, env: &Env) -> i32 {
     // the template, from a saved recipe or from the ops as given
     let template_raw: String = if !recipe.is_empty() {
         if !cfg0.usable() {
-            println!("{}", json!({"ok": false, "error": "a recipe needs the Collide server (no config/credential here)"}));
+            println!("{}", json!({"ok": false, "error": "a recipe needs the Cork server (no config/credential here)"}));
             return 1;
         }
         match http::post(&cfg0.server, "/recipe/get", &cfg0.token, &user_agent(),
@@ -189,7 +189,7 @@ fn run_with(arg: &str, recipe: &str, at: &str, save: &str, env: &Env) -> i32 {
         let mut callers: Vec<(String, String)> = Vec::new();
         if template.to_string().contains("$caller") {
             if !cfg0.usable() {
-                println!("{}", json!({"ok": false, "error": "$caller ops need the Collide server to list the callers"}));
+                println!("{}", json!({"ok": false, "error": "$caller ops need the Cork server to list the callers"}));
                 return 1;
             }
             if let Ok(r) = http::post(&cfg0.server, "/callers", &cfg0.token, &user_agent(),
@@ -256,10 +256,10 @@ fn run_batch(raw: &str, recipe_id: &str, save: Option<(String, String, String)>,
     let parsed = serde_json::from_str::<Value>(&raw)
         .or_else(|first| serde_json::from_str::<Value>(&raw.replace("\\'", "'")).map_err(|_| first));
     let Ok(ops_json) = parsed else {
-        println!("{}", json!({"_result": "REFUSED — the op must be a JSON object or a list of them", "ok": false, "error": "the op must be a JSON object or a list of them (pass a batch on stdin with a heredoc to avoid shell quoting; `collide-hook apply --help` for the shape)"}));
+        println!("{}", json!({"_result": "REFUSED — the op must be a JSON object or a list of them", "ok": false, "error": "the op must be a JSON object or a list of them (pass a batch on stdin with a heredoc to avoid shell quoting; `cork apply --help` for the shape)"}));
         return 1;
     };
-    let ops = match collide_core::edit::parse_ops(&ops_json) {
+    let ops = match cork_core::edit::parse_ops(&ops_json) {
         Ok(ops) => ops,
         Err(problem) => {
             println!("{}", json!({"_result": format!("REFUSED — {problem}"), "ok": false, "error": problem}));
@@ -279,7 +279,7 @@ fn run_batch(raw: &str, recipe_id: &str, save: Option<(String, String, String)>,
         }
     }
     // all of it in memory first: a refusal here costs nothing anywhere
-    let applied = match collide_core::edit::apply_all(&ops, &files) {
+    let applied = match cork_core::edit::apply_all(&ops, &files) {
         Ok(applied) => applied,
         Err(problem) => {
             println!("{}", json!({"_result": format!("REFUSED — {problem}; nothing was written"), "ok": false, "error": problem, "written": false}));
@@ -342,7 +342,7 @@ fn run_batch(raw: &str, recipe_id: &str, save: Option<(String, String, String)>,
         symbols.insert(symbol.to_string());
     }
     let summary = format!(
-        "{} typed op(s) via collide-hook apply{}: {}",
+        "{} typed op(s) via cork apply{}: {}",
         ops.len(),
         if recipe_id.is_empty() { String::new() } else { format!(" (recipe {recipe_id})") },
         ops.iter().map(|op| op.kind()).collect::<Vec<_>>().join(", ")

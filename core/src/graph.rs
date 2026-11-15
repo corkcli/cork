@@ -475,3 +475,88 @@ pub fn resolve_edges(
     }
     collected.into_values().collect()
 }
+
+#[cfg(test)]
+mod resolution_ported_tests {
+    use super::*;
+    use crate::engine;
+
+    const FILES: &[(&str, &str)] = &[
+        ("pkg/core.py", "RATE = 0.2\n\n\nclass Ledger:\n    def post(self, a):\n        return a\n\n\ndef compute_tax(items):\n    return sum(items) * RATE\n"),
+        ("pkg/billing.py", "from .core import compute_tax, Ledger\nimport os.path as osp\n\n\nclass AuditLedger(Ledger):\n    def post(self, a):\n        return total([a]) + osp.sep\n\n\ndef total(items):\n    return sum(items) + compute_tax(items)\n"),
+        ("svc/main.go", "package main\nimport (\n \"fmt\"\n u \"example.com/m/util\"\n)\nfunc Run() { u.Help(); fmt.Println() }\n"),
+        ("svc/util/util.go", "package util\nfunc Help() {}\n"),
+        ("app/util/Tool.java", "package app.util;\nclass Tool { static int use() { return 1; } }\n"),
+        ("shop/__init__.py", ""),
+        ("shop/db.py", "def orders():\n    return []\n"),
+        ("shop/report.py", "from shop import db\nfrom . import db as rows\n\n\ndef total():\n    return len(db.orders()) + len(rows.orders())\n"),
+        ("shop/mail.py", "def body(order):\n    from shop.db import orders\n    import shop.db as rows\n    return len(orders()) + len(rows.orders())\n"),
+    ];
+
+    fn resolve(path: &str) -> Vec<(String, String, String, &'static str)> {
+        let parsed: Vec<(&str, engine::ParseOutput)> = FILES
+            .iter()
+            .map(|(p, src)| (*p, engine::parse(p, src).unwrap_or_else(|| panic!("{p} parses"))))
+            .collect();
+        let known: BTreeSet<String> = FILES.iter().map(|(p, _)| p.to_string()).collect();
+        let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (p, out) in &parsed {
+            for symbol in &out.symbols {
+                names.entry(symbol.name.clone()).or_default().push(p.to_string());
+            }
+        }
+        let (_, out) = parsed.iter().find(|(p, _)| *p == path).expect("a fixture path");
+        assert_eq!(out.status, "clean", "{path}");
+        let symbols: Vec<SymbolEdges> = out.symbols.iter().map(|s| SymbolEdges { name: &s.name, edges: &s.edges }).collect();
+        let imports: Vec<ImportSpec> = out.imports.iter()
+            .map(|i| ImportSpec { module: i.module.clone(), names: i.names.clone() })
+            .collect();
+        let mut edges: Vec<_> = resolve_edges(path, out.language, &symbols, &imports, &known, &names)
+            .into_iter()
+            .map(|e| (e.from, e.to, e.kind, e.confidence))
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    #[test]
+    fn an_imported_function_resolves_to_its_definition() {
+        let edges = resolve("pkg/billing.py");
+        assert!(edges.iter().any(|(from, to, _, confidence)| from == "pkg/billing.py::total"
+            && to == "pkg/core.py::compute_tax" && *confidence == EXTRACTED), "{edges:?}");
+        assert!(edges.iter().any(|(_, to, kind, _)| to == "pkg/core.py::Ledger" && kind == "inherits"), "{edges:?}");
+    }
+
+    #[test]
+    fn a_submodule_imported_from_its_package_resolves_to_the_submodule() {
+        let edges = resolve("shop/report.py");
+        let targets: Vec<&str> = edges.iter().map(|(_, to, _, _)| to.as_str()).collect();
+        assert!(targets.contains(&"shop/db.py::orders"), "{edges:?}");
+        assert!(!targets.iter().any(|t| t.starts_with("shop/__init__.py")), "{edges:?}");
+    }
+
+    #[test]
+    fn an_import_inside_a_function_binds_what_it_calls() {
+        let edges = resolve("shop/mail.py");
+        assert!(edges.iter().any(|(_, to, _, _)| to == "shop/db.py::orders"), "{edges:?}");
+    }
+
+    #[test]
+    fn module_resolution_is_language_aware() {
+        let known: BTreeSet<String> = ["pkg/app.py", "pkg/billing.py", "src/a.ts", "src/lib/b.ts"]
+            .into_iter().map(String::from).collect();
+        assert_eq!(resolve_module(".billing", "pkg/app.py", "python", &known).as_deref(), Some("pkg/billing.py"));
+        assert_eq!(resolve_module("./lib/b", "src/a.ts", "typescript", &known).as_deref(), Some("src/lib/b.ts"));
+        assert_eq!(resolve_module("../a", "src/lib/b.ts", "typescript", &known).as_deref(), Some("src/a.ts"));
+        // a package, not a repo file: honestly unresolved rather than guessed
+        assert_eq!(resolve_module("react", "src/a.ts", "typescript", &known), None);
+    }
+
+    #[test]
+    fn resolution_is_deterministic_when_two_directories_tie() {
+        let first = resolve("svc/main.go");
+        for _ in 0..5 {
+            assert_eq!(resolve("svc/main.go"), first);
+        }
+    }
+}

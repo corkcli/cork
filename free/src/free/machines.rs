@@ -1,4 +1,4 @@
-//! The free version has no machine accounts (multi-machine sync); the cloud's lives in Collide's private
+//! The free version has no machine accounts (multi-machine sync); the cloud's lives in Cork's private
 //! repo. These are its free answers, under the same names, so the engine
 //! builds and runs on one machine without it.
 
@@ -15,11 +15,15 @@ pub const SYNCED_KINDS: &[&str] = &[
 ];
 
 fn not_here() -> Value {
-    json!({"ok": false, "error": "machine accounts are part of Collide's cloud"})
+    json!({"ok": false, "error": "machine accounts are part of Cork's cloud"})
 }
 
 pub fn plan_answer(_store: &Store, _workspace: &str) -> Value {
     not_here()
+}
+
+pub fn hours_answer(_store: &Store, _workspace: &str, _uid: &str) -> Value {
+    Value::Null
 }
 
 pub fn record(_store: &Store, _workspace: &str, _uid: &str, _email: &str, _body: &Value) -> Value {
@@ -42,6 +46,8 @@ pub async fn free_script_now(_server: &str) -> Option<String> {
     None
 }
 
-pub fn offer_free(_store: &Store, _public_url: &str, _workspace: &str, _uid: &str, _email: &str, _name: &str) -> Option<Value> {
+pub fn offer_free(
+    _store: &Store, _public_url: &str, _workspace: &str, _workspaces: &[String], _uid: &str, _email: &str, _name: &str,
+) -> Option<Value> {
     None
 }

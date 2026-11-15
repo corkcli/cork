@@ -6,7 +6,7 @@
 //! ledger's last day of change events by OTHER people, that cursor says how
 //! current the person's agents are: `seen` of `total`, and the `unseen` rows
 //! still waiting for their next call. The dashboard's members panel shows
-//! it beside each player. Python's `knows_*` in service.py, row for row.
+//! it beside each player.
 
 use std::collections::BTreeSet;
 

@@ -1,11 +1,9 @@
-//! Hashes that must match the Python server byte for byte.
+//! Hashes whose bytes are part of the stored data.
 //!
 //! These are not internal details: the ledger chain hash is what makes the
 //! record tamper-evident, and the merkle root is what two workspaces compare
-//! to decide whether they have diverged. If the two implementations disagree
-//! on either, the chain reads as broken and every collision check goes wrong.
-//! `tests/test_rust_server.py` computes both in Python and in Rust over the
-//! same inputs and asserts they are identical.
+//! to decide whether they have diverged. A change to either encoding makes
+//! every row already written read as broken, so both are pinned by tests.
 
 use std::collections::BTreeMap;
 
@@ -21,16 +19,15 @@ pub fn empty_root() -> String {
     sha256_hex("collide:empty")
 }
 
-/// One JSON string, escaped the way Python's `json.dumps` escapes it.
+/// One JSON string, escaped the way Python's `json.dumps` escapes it (the
+/// encoding the ledger has always been hashed over).
 ///
-/// Python defaults to `ensure_ascii=True`, which emits every character
-/// outside printable ASCII as `\uXXXX` (a surrogate pair above U+FFFF).
-/// serde emits raw UTF-8. For anything that is merely displayed that
-/// difference is invisible; for the ledger's chain hash it is the difference
-/// between a verified chain and a broken one, because the two servers share
-/// one database and each re-verifies rows the other wrote. A single em dash
-/// in an agent's summary, or an accent in a path, was enough — and every
-/// fixture in the parity suite was pure ASCII, so nothing caught it.
+/// That is `ensure_ascii=True`, which emits every character outside
+/// printable ASCII as `\uXXXX` (a surrogate pair above U+FFFF). serde emits
+/// raw UTF-8. For anything that is merely displayed that difference is
+/// invisible; for the ledger's chain hash it is the difference between a
+/// verified chain and a broken one. A single em dash in an agent's summary,
+/// or an accent in a path, is enough.
 ///
 /// `graphview::cypher_str` is the same transform for the Cypher exporter; it
 /// is kept separate only because that module is the one that discovered the
@@ -77,9 +74,10 @@ pub fn canonical_json(value: &serde_json::Value) -> String {
     compact(&sorted(value))
 }
 
-/// The compact separators, with Python's string escaping. Numbers, booleans
-/// and null are left to serde, which agrees with Python across the integer
-/// range and the epoch-scale floats these payloads actually carry.
+/// The compact separators, with [`ascii_string`]'s string escaping.
+/// Numbers, booleans and null are left to serde, which renders the integer
+/// range and the epoch-scale floats these payloads carry the same way the
+/// stored rows were hashed.
 fn compact(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Object(map) => {
@@ -98,7 +96,7 @@ fn compact(value: &serde_json::Value) -> String {
     }
 }
 
-/// Keys sorted recursively — Python's `sort_keys=True`.
+/// Keys sorted recursively.
 pub(crate) fn sorted(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -134,16 +132,15 @@ pub fn chain_hash(
     sha256_hex(&format!("{prev_hash}{body}"))
 }
 
-/// The same link as this half computed it before 2026-09-22 (b69c97a):
+/// The link as it was computed before 2026-09-22 (b69c97a):
 /// sorted keys, compact separators, but serde's raw UTF-8 instead of
-/// Python's `\uXXXX` escapes. Rows written in that window carry hashes over
+/// `\uXXXX` escapes. Rows written in that window carry hashes over
 /// that encoding, so re-verifying them with [`chain_hash`] alone reports the
 /// chain broken at the first one whose payload had a non-ASCII character —
 /// an em dash in a summary was enough. Verification accepts either encoding
 /// for a row's OWN hash (the link to the previous row stays exact), because
 /// re-writing history to fix an encoder is the one thing a hash chain must
 /// never do. Nothing writes this encoding any more; it exists only to read.
-/// Python's `legacy_chain_hash`.
 pub fn legacy_chain_hash(
     prev_hash: &str,
     scope: &str,
@@ -196,9 +193,7 @@ pub fn dir_of(path: &str) -> String {
     }
 }
 
-// Phase 1 uses part of this surface; the rest is what the endpoints
-// still to move across will call. Kept whole so the tier is reviewable
-// against the Python driver side by side rather than in fragments.
+// Not every method has a caller yet; kept whole rather than in fragments.
 #[allow(dead_code)]
 pub struct Tree {
     pub root: String,
@@ -244,7 +239,7 @@ impl Tree {
     /// `services/` changed" as a single compare, whatever the repo's size.
     /// Same recipe as the dir hashes (sorted `path:hash` lines), so the
     /// empty prefix is a root over every file and two trees agreeing on a
-    /// subtree agree on every symbol in it. Python: merkle.subtree_root.
+    /// subtree agree on every symbol in it.
     pub fn subtree_root(&self, prefix: &str) -> String {
         let entries: Vec<String> = self
             .files
@@ -332,5 +327,53 @@ mod subtree_tests {
         let b = tree(&[("services/svc0.py", "h1"), ("services/svc1.py", "h9")]);
         assert_ne!(a.subtree_root("services/"), b.subtree_root("services/"));
         assert_eq!(a.subtree_root("nothing/"), empty_root());
+    }
+}
+
+#[cfg(test)]
+mod merkle_ported_tests {
+    use super::*;
+
+    /// A file's hash from its parsed symbols, the way the report pipeline
+    /// rolls it up: symbol name to symbol hash.
+    fn file_of(src: &str) -> String {
+        let out = cork_core::engine::parse("a.py", src).expect("python parses");
+        file_hash(&out.symbols.iter().map(|s| (s.name.clone(), s.hash.clone())).collect())
+    }
+
+    fn tree(entries: &[(&str, &str)]) -> Tree {
+        Tree::build(entries.iter().map(|(p, h)| (p.to_string(), h.to_string())).collect())
+    }
+
+    #[test]
+    fn identical_content_gives_identical_roots() {
+        let fh = file_of("def f():\n    return 1\n");
+        let (a, b) = (tree(&[("pkg/a.py", &fh), ("b.py", &fh)]), tree(&[("pkg/a.py", &fh), ("b.py", &fh)]));
+        assert_eq!(a.root, b.root);
+        assert!(Tree::diverging_files(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn the_diverging_walk_returns_exactly_the_changed_files() {
+        let (f1, f2) = (file_of("def f():\n    return 1\n"), file_of("def f():\n    return 2\n"));
+        let same = file_of("def g():\n    return 3\n");
+        let a = tree(&[("pkg/a.py", &f1), ("pkg/b.py", &same), ("other/c.py", &same)]);
+        let b = tree(&[("pkg/a.py", &f2), ("pkg/b.py", &same), ("other/c.py", &same)]);
+        assert_ne!(a.root, b.root);
+        assert_eq!(Tree::diverging_files(&a, &b), vec!["pkg/a.py".to_string()]);
+    }
+
+    #[test]
+    fn moving_a_symbol_leaves_the_file_hash_alone() {
+        assert_eq!(
+            file_of("def f():\n    return 1\n\ndef g():\n    return 2\n"),
+            file_of("def g():\n    return 2\n\ndef f():\n    return 1\n"),
+        );
+    }
+
+    #[test]
+    fn the_empty_tree_has_the_stable_empty_root() {
+        assert_eq!(Tree::build(BTreeMap::new()).root, empty_root());
+        assert_eq!(Tree::empty().root, empty_root());
     }
 }

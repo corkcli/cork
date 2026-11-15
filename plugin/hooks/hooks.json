@@ -1,12 +1,12 @@
 {
-  "description": "Collide: briefings, teammates' changes, the write gate and landing, all from the native collide-hook.",
+  "description": "Cork: briefings, teammates' changes, the write gate and landing, all from the native cork program.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" session-start",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" session-start",
             "timeout": 30
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" report",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" report",
             "timeout": 10
           }
         ]
@@ -25,11 +25,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|Bash",
+        "matcher": "Edit|Write|MultiEdit|Bash|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" gate",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" gate",
             "timeout": 5
           }
         ]
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" report",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" report",
             "timeout": 5
           }
         ]
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" report",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" report",
             "timeout": 5
           }
         ]
@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" report",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" report",
             "timeout": 5
           }
         ]
@@ -74,7 +74,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" report",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" report",
             "timeout": 10
           }
         ]
@@ -85,7 +85,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" report",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" report",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" report",
             "timeout": 5
           }
         ]
@@ -96,7 +107,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/collide\" report",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/cork\" report",
             "timeout": 5
           }
         ]

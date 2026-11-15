@@ -10,7 +10,7 @@
 //! repos that merely share a basename never do. When it cannot tell, it
 //! demands an exact match rather than guessing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::RwLock;
 
 use sha1::{Digest, Sha1};
@@ -21,8 +21,8 @@ use sha1::{Digest, Sha1};
 /// sha1, not sha256 — and that is not an aesthetic choice. Both servers scan
 /// `hot:{scope}:{path_key}:` and write `salience:{scope}:{path_key}`, so a
 /// different digest here would silently split every path into two key spaces:
-/// the Rust gate would find no hot markers, the Python dashboard would show
-/// half the scar tissue, and nothing would error. The parity test pins it.
+/// the gate would find no hot markers already written, the dashboard would
+/// show half the scar tissue, and nothing would error. A test pins it.
 pub fn path_key(path: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(path.as_bytes());
@@ -101,6 +101,103 @@ pub fn repo_org(repo_id: &str) -> String {
     if parts.len() >= 2 { parts[parts.len() - 2].to_string() } else { String::new() }
 }
 
+/// A key of the bare `owner/name` form: two segments, and the first is no
+/// host (a host has a dot). `acme/api`, not `github.com/api` or `api`.
+fn is_owner_name(key: &str) -> bool {
+    let mut parts = key.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None) => !owner.is_empty() && !name.is_empty() && !owner.contains('.'),
+        _ => false,
+    }
+}
+
+/// `(host, "owner/name")` of a host-qualified key: three or more segments,
+/// the first a host (it has a dot). `None` for anything else, a folder on
+/// one machine included (`/home/jo/acme/api` has no host).
+fn host_and_owner_name(key: &str) -> Option<(&str, &str)> {
+    let (host, rest) = key.split_once('/')?;
+    if host.is_empty() || !host.contains('.') || rest.matches('/').count() < 1 {
+        return None;
+    }
+    let name_at = rest.rfind('/')?;
+    let owner_at = rest[..name_at].rfind('/').map(|i| i + 1).unwrap_or(0);
+    let owner_name = &rest[owner_at..];
+    is_owner_name(owner_name).then_some((host, owner_name))
+}
+
+/// Two spellings of ONE repo: the same access key, or a bare `owner/name`
+/// beside `host/owner/name` (an agent passing `initech/TPS` while the hook
+/// reports `github.com/initech/tps`). Whether the bare form is unambiguous —
+/// one host has that `owner/name`, not two — is the caller's to know; this
+/// only compares the pair.
+pub fn same_repo(a: &str, b: &str) -> bool {
+    let (ka, kb) = (repo_key(a), repo_key(b));
+    if ka.is_empty() || kb.is_empty() {
+        return false;
+    }
+    if ka == kb {
+        return true;
+    }
+    let bridged = |bare: &str, full: &str| {
+        is_owner_name(bare) && host_and_owner_name(full).is_some_and(|(_, owner_name)| owner_name == bare)
+    };
+    bridged(&ka, &kb) || bridged(&kb, &ka)
+}
+
+/// One repo spelled `owner/name` and `host/owner/name` counts once — the
+/// host-qualified key stands for both — unless two hosts have that
+/// `owner/name`, when neither can say which it meant.
+pub fn dedupe_spellings(keys: std::collections::BTreeSet<String>) -> std::collections::BTreeSet<String> {
+    keys.iter()
+        .filter(|key| {
+            let matches = keys.iter().filter(|other| *other != *key && same_repo(key, other)).count();
+            // a bare key (one slash) with exactly one host-qualified twin
+            // is that twin
+            !(matches == 1 && key.matches('/').count() == 1)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Is `repo_id` one of `bound`, in any spelling of it?
+pub fn bound_contains(bound: &std::collections::BTreeSet<String>, repo_id: &str) -> bool {
+    let key = repo_key(repo_id);
+    if bound.contains(&key) {
+        return true;
+    }
+    let twins: Vec<&String> = bound.iter().filter(|other| same_repo(&key, other)).collect();
+    twins.len() == 1
+}
+
+/// The repo a workspace already has under the same name and host, but
+/// another owner: `github.com/globex/web` arriving where `github.com/acme/web`
+/// is bound is most likely the same repo after a transfer on GitHub (whose
+/// old URL keeps serving the same refs, so git never tells a stale clone).
+/// Never a guess between several: only exactly one such repo answers.
+/// `known` is the workspace's bound ids and ids with data, less any the
+/// people said are a different repo.
+pub fn lookalike(known: &[String], incoming: &str) -> Option<String> {
+    let key = repo_key(incoming);
+    let (host, owner_name) = host_and_owner_name(&key)?;
+    let (owner, name) = owner_name.split_once('/')?;
+    let mut found: Vec<(String, &String)> = Vec::new();
+    for id in known {
+        let candidate = repo_key(id);
+        if candidate == key || found.iter().any(|(k, _)| *k == candidate) {
+            continue;
+        }
+        let Some((their_host, their_owner_name)) = host_and_owner_name(&candidate) else { continue };
+        let Some((their_owner, their_name)) = their_owner_name.split_once('/') else { continue };
+        if their_host == host && their_name == name && their_owner != owner {
+            found.push((candidate.clone(), id));
+        }
+    }
+    match found.as_slice() {
+        [(_, only)] => Some((*only).clone()),
+        _ => None,
+    }
+}
+
 /// How host/org-qualified an id is; a full URL outranks a bare name when both
 /// claim the same normalized key.
 fn qualification(repo_id: &str) -> usize {
@@ -114,6 +211,15 @@ pub struct Aliases {
     alias: RwLock<HashMap<String, String>>,
     ambiguous: RwLock<HashSet<String>>,
     renames: RwLock<HashMap<String, String>>,
+    /// `{workspace}:{owner/name}` -> every host-qualified id seen with that
+    /// owner and name, by access key. One entry: a bare `owner/name` means
+    /// it. Two (github.com and gitlab.com both have `acme/api`): ambiguous,
+    /// and the bare form stays exact.
+    hosts: RwLock<HashMap<String, BTreeMap<String, String>>>,
+    /// `{workspace}:{owner/name}` whose bare AND host-qualified spellings
+    /// both held data when the server started: two scopes until someone
+    /// merges them (`repo-merge`), so no deploy ever hides history.
+    split: RwLock<HashSet<String>>,
 }
 
 impl Aliases {
@@ -126,6 +232,61 @@ impl Aliases {
     pub fn add_rename(&self, workspace_id: &str, from: &str, canonical: &str) {
         if let Ok(mut renames) = self.renames.write() {
             renames.insert(format!("{workspace_id}:{from}"), canonical.to_string());
+        }
+    }
+
+    /// Undo [`Self::add_rename`]: `from` resolves on its own again.
+    pub fn remove_rename(&self, workspace_id: &str, from: &str) {
+        if let Ok(mut renames) = self.renames.write() {
+            renames.remove(&format!("{workspace_id}:{from}"));
+        }
+    }
+
+    /// Note a host-qualified id under its `owner/name`, so a bare spelling
+    /// knows how many hosts it could mean. Cheap when already noted.
+    fn note_host(&self, workspace_id: &str, repo_id: &str) {
+        let key = repo_key(repo_id);
+        let Some((_, owner_name)) = host_and_owner_name(&key) else { return };
+        let slot = format!("{workspace_id}:{owner_name}");
+        let known = self.hosts.read().map(|h| h.get(&slot).is_some_and(|ids| ids.contains_key(&key))).unwrap_or(true);
+        if !known {
+            if let Ok(mut hosts) = self.hosts.write() {
+                hosts.entry(slot).or_default().entry(key).or_insert_with(|| repo_id.to_string());
+            }
+        }
+    }
+
+    /// May `incoming` share `canonical`'s scope because one is the bare
+    /// `owner/name` of the other? Only when one host has that `owner/name`
+    /// and the pair was not already two scopes holding data.
+    fn owner_name_bridge(&self, workspace_id: &str, canonical: &str, incoming: &str) -> bool {
+        if !same_repo(canonical, incoming) {
+            return false;
+        }
+        let (ka, kb) = (repo_key(canonical), repo_key(incoming));
+        let bare = if is_owner_name(&ka) { ka } else { kb };
+        let slot = format!("{workspace_id}:{bare}");
+        if self.split.read().map(|s| s.contains(&slot)).unwrap_or(true) {
+            return false;
+        }
+        self.hosts.read().map(|h| h.get(&slot).map_or(0, BTreeMap::len) <= 1).unwrap_or(false)
+    }
+
+    /// The one host-qualified id a bare `owner/name` means, when exactly one
+    /// is known and the pair is not split.
+    fn qualified_for(&self, workspace_id: &str, repo_id: &str) -> Option<String> {
+        let key = repo_key(repo_id);
+        if !is_owner_name(&key) {
+            return None;
+        }
+        let slot = format!("{workspace_id}:{key}");
+        if self.split.read().map(|s| s.contains(&slot)).unwrap_or(true) {
+            return None;
+        }
+        let hosts = self.hosts.read().ok()?;
+        match hosts.get(&slot) {
+            Some(ids) if ids.len() == 1 => ids.values().next().cloned(),
+            _ => None,
         }
     }
 
@@ -168,6 +329,23 @@ impl Aliases {
         }
         if let Ok(mut marked) = self.ambiguous.write() {
             marked.extend(ambiguous);
+        }
+        // `owner/name` beside `host/owner/name`: every host-qualified id is
+        // noted under its owner/name, and a bare spelling that ALSO holds
+        // data is a split pair — kept exact until merged, never hidden
+        let mut bare: Vec<String> = Vec::new();
+        for scope in scopes {
+            let Some((workspace_id, repo_id)) = scope.split_once(':') else { continue };
+            let key = repo_key(repo_id);
+            if is_owner_name(&key) {
+                bare.push(format!("{workspace_id}:{key}"));
+            } else {
+                self.note_host(workspace_id, repo_id);
+            }
+        }
+        let hosts = self.hosts.read().map(|h| h.clone()).unwrap_or_default();
+        if let Ok(mut split) = self.split.write() {
+            split.extend(bare.into_iter().filter(|slot| hosts.get(slot).is_some_and(|ids| !ids.is_empty())));
         }
     }
 
@@ -221,19 +399,33 @@ impl Aliases {
         }
 
         let nkey = format!("{workspace_id}:{}", normalize_repo_id(&repo_id));
+        self.note_host(workspace_id, &repo_id);
         if self.ambiguous.read().map(|a| a.contains(&nkey)).unwrap_or(false) {
+            // two repos share the basename, but `acme/api` still names one
+            // of them when a single host has that owner and name
+            if let Some(full) = self.qualified_for(workspace_id, &repo_id) {
+                return self.resolve_inner(workspace_id, &full, depth + 1);
+            }
             return repo_id;
         }
         let existing = self.alias.read().ok().and_then(|a| a.get(&nkey).cloned());
         if let Some(canonical) = existing {
             // basename aliasing bridges a BARE name and the full URL of one
             // repo — never two host-qualified ids that merely share a basename
-            // (github.com/acme/api and github.com/other/api are two repos)
+            // (github.com/acme/api and github.com/other/api are two repos).
+            // `acme/api` and `github.com/acme/api` are one repo, though: the
+            // same owner and name, on the one host that has them
             if canonical != repo_id
                 && canonical.contains('/')
                 && repo_id.contains('/')
                 && repo_key(&canonical) != repo_key(&repo_id)
             {
+                if self.owner_name_bridge(workspace_id, &canonical, &repo_id) {
+                    return canonical;
+                }
+                if let Some(full) = self.qualified_for(workspace_id, &repo_id) {
+                    return self.resolve_inner(workspace_id, &full, depth + 1);
+                }
                 return repo_id;
             }
             return canonical;
@@ -261,6 +453,81 @@ mod tests {
         for repo in ["github.com/acme/api", "git@gitlab.com:group/app.git", "acme/api", "collide", "r-doc-empty"] {
             assert!(!is_machine_folder(repo), "{repo}");
         }
+    }
+
+    #[test]
+    fn owner_name_and_its_host_qualified_url_are_one_repo() {
+        assert!(same_repo("initech/TPS", "github.com/initech/tps"));
+        assert!(same_repo("github.com/initech/tps", "initech/TPS"));
+        assert!(same_repo("git@github.com:Acme/API.git", "https://github.com/acme/api#main"));
+        // another owner, or a host standing where the owner should be, is not
+        assert!(!same_repo("github.com/acme/api", "github.com/other/api"));
+        assert!(!same_repo("other/api", "github.com/acme/api"));
+        assert!(!same_repo("github.com/api", "gitlab.com/github.com/api"));
+        // a folder on one machine never becomes a repo by its last two names
+        assert!(!same_repo("acme/api", "/home/jo/acme/api"));
+        assert!(!same_repo("acme/api", "api"));
+    }
+
+    #[test]
+    fn a_bare_owner_name_lands_on_the_one_host_qualified_scope() {
+        let aliases = Aliases::new();
+        aliases.seed(&["w:github.com/initech/tps".to_string()]);
+        assert_eq!(aliases.resolve("w", "initech/TPS"), "github.com/initech/tps");
+        assert_eq!(aliases.resolve("w", "github.com/initech/tps"), "github.com/initech/tps");
+        // another workspace knows nothing of it
+        assert_eq!(aliases.resolve("v", "initech/TPS"), "initech/TPS");
+        // a basename two owners share still lets owner/name find its own
+        let shared = Aliases::new();
+        shared.seed(&["w:github.com/acme/api".to_string(), "w:github.com/other/api".to_string()]);
+        assert_eq!(shared.resolve("w", "acme/api"), "github.com/acme/api");
+        assert_eq!(shared.resolve("w", "other/api"), "github.com/other/api");
+        assert_eq!(shared.resolve("w", "github.com/other/api"), "github.com/other/api");
+    }
+
+    #[test]
+    fn a_bare_owner_name_on_two_hosts_stays_exact() {
+        let aliases = Aliases::new();
+        aliases.seed(&["w:github.com/acme/api".to_string(), "w:gitlab.com/acme/api".to_string()]);
+        assert_eq!(aliases.resolve("w", "acme/api"), "acme/api");
+        // and a second host seen at runtime makes the first's bridge ambiguous too
+        let runtime = Aliases::new();
+        runtime.seed(&["w:github.com/acme/web".to_string()]);
+        assert_eq!(runtime.resolve("w", "gitlab.com/acme/web"), "gitlab.com/acme/web");
+        assert_eq!(runtime.resolve("w", "acme/web"), "acme/web");
+    }
+
+    #[test]
+    fn two_spellings_that_both_hold_data_stay_two_scopes_until_merged() {
+        let aliases = Aliases::new();
+        aliases.seed(&["w:github.com/initech/tps".to_string(), "w:initech/TPS".to_string()]);
+        assert_eq!(aliases.resolve("w", "initech/TPS"), "initech/TPS");
+        assert_eq!(aliases.resolve("w", "github.com/initech/tps"), "github.com/initech/tps");
+        // the merge is an explicit alias, which outranks the split
+        aliases.add_rename("w", "initech/TPS", "github.com/initech/tps");
+        assert_eq!(aliases.resolve("w", "initech/TPS"), "github.com/initech/tps");
+        aliases.remove_rename("w", "initech/TPS");
+        assert_eq!(aliases.resolve("w", "initech/TPS"), "initech/TPS");
+    }
+
+    #[test]
+    fn a_repo_under_a_new_owner_finds_the_one_the_workspace_has() {
+        let known = vec!["github.com/acme/web".to_string(), "github.com/initech/tps".to_string()];
+        assert_eq!(lookalike(&known, "github.com/globex/web").as_deref(), Some("github.com/acme/web"));
+        assert_eq!(lookalike(&known, "git@github.com:Globex/Web.git").as_deref(), Some("github.com/acme/web"));
+        // the repo itself, another name, another host, a bare id: nothing
+        assert_eq!(lookalike(&known, "github.com/acme/web"), None);
+        assert_eq!(lookalike(&known, "github.com/globex/papaya"), None);
+        assert_eq!(lookalike(&known, "gitlab.com/globex/web"), None);
+        assert_eq!(lookalike(&known, "globex/web"), None);
+        // two candidates: no guess
+        let two = vec!["github.com/acme/web".to_string(), "github.com/someone/web".to_string()];
+        assert_eq!(lookalike(&two, "github.com/globex/web"), None);
+        // one repo spelled twice is one candidate
+        let spelled = vec!["github.com/acme/web".to_string(), "github.com/Acme/Web".to_string()];
+        assert_eq!(lookalike(&spelled, "github.com/globex/web").as_deref(), Some("github.com/acme/web"));
+        // a pair the people called different is left out of `known` by the caller
+        assert_eq!(lookalike(&[], "github.com/globex/web"), None);
     }
 
     #[test]

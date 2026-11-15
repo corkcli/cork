@@ -22,7 +22,7 @@ jobs:
       - name: Test the hooks
         working-directory: hooks
         run: cargo test --release
-      - name: Build collide
+      - name: Build cork
         working-directory: free
         run: cargo build --release
       - name: Test the engine

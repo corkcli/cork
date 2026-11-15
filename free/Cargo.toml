@@ -1,20 +1,20 @@
 [package]
-name = "collide-free"
+name = "cork-free"
 version = "0.1.0"
 edition = "2021"
-description = "Collide's server in Rust. Phase 1: the hot HTTP endpoints, sharing the live database with the Python server."
+description = "Cork's server: the hooks' routes, MCP, OAuth, billing and the dashboard's API over one SQLite file."
 license = "MIT"
 
 [[bin]]
-name = "collide"
+name = "cork"
 path = "src/main.rs"
 
 [features]
 default = ["cli"]
-# the free version's one program, `collide`: this engine's local server (run
-# as `collide local`) with the hooks linked in
-cli = ["dep:collide-hooks"]
-# Collide's cloud (accounts, billing, teams across machines, embeddings) is
+# the free version's one program, `cork`: this engine's local server (run
+# as `cork local`) with the hooks linked in
+cli = ["dep:cork-hooks"]
+# Cork's cloud (accounts, billing, teams across machines, embeddings) is
 # not in this repository; src/free/ answers in its place
 cloud = []
 
@@ -29,8 +29,10 @@ regex = "1"
 # UTC month keys for the usage counter; no other date handling needed
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { version = "0.32", features = ["bundled", "session"] }
+# engine snapshots are gzipped before they go to object storage
+flate2 = "1"
 # the parse engine and graph resolution, without the Python extension feature
-collide-core = { path = "../core", default-features = false }
+cork-core = { path = "../core", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "3.4.0", default-features = false, features = ["server", "transport-streamable-http-server", "elicitation"] }
@@ -42,8 +44,11 @@ base64 = "0.22"
 url = "2"
 ureq = { version = "2.12.1", default-features = false, features = ["tls", "gzip"] }
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+# Web Bot Auth (webbotauth.rs): Ed25519 signatures on requests to other
+# sites; already in the tree through jsonwebtoken and cork-hooks
+ed25519-dalek = "2.2"
 tower-http = { version = "0.7.1", features = ["catch-panic", "cors"] }
-collide-hooks = { path = "../hooks", optional = true }
+cork-hooks = { path = "../hooks", optional = true }
 # the graph snapshot resolves each file's imports on its own core (graphview.rs)
 rayon = "1.12"
 # the cloud server's allocator (main.rs): returns freed memory to the system,
@@ -51,6 +56,21 @@ rayon = "1.12"
 mimalloc = { version = "0.1", default-features = false, optional = true }
 # mi_collect: the memory watchdog hands freed memory back (membudget.rs)
 libmimalloc-sys = { version = "0.1", optional = true, features = ["extended"] }
+
+# the real-time protocol (protocol_ws.rs): the sans-IO engine and the code
+# domain, both builds
+cork-protocol = { path = "../protocol/core" }
+cork-protocol-code = { path = "../protocol/domains/code" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[dev-dependencies]
+# ServiceExt::oneshot: the route tests drive the router (unread_tests.rs)
+tower = { version = "0.5", features = ["util"] }
+# the protocol's blocking client drives the WebSocket tests
+cork-protocol = { path = "../protocol/core", features = ["ws-client-blocking"] }
+# a throwaway RSA key for the GitHub App's JWT tests (already in the tree
+# through jsonwebtoken's rust_crypto backend)
+rsa = "0.9"
 
 [profile.release]
 opt-level = 3

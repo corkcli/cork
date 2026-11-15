@@ -1,7 +1,7 @@
 //! Hermes's hook payloads, in their own process: the harness is chosen once
 //! per process, and every other test runs as Claude Code.
 
-use collide_hooks::harness;
+use cork_hooks::harness;
 use serde_json::json;
 
 #[test]

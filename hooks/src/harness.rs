@@ -4,7 +4,7 @@
 //! vocabulary every branch in `report.rs` and `gate.rs` already speaks; a
 //! foreign harness is translated at the two edges — what comes in, and what it
 //! reads back — and nowhere else. The harness is named on argv by the config
-//! Collide generates, never sniffed from the payload: a sniffer that guesses
+//! Cork generates, never sniffed from the payload: a sniffer that guesses
 //! wrong fails silently, and silence is the one failure these hooks cannot
 //! afford. No flag means Claude Code, so every artifact already committed
 //! keeps working untouched.
@@ -38,6 +38,35 @@ pub fn set(name: &str) {
 
 pub fn current() -> &'static str {
     HARNESS.get().map(String::as_str).unwrap_or("claude")
+}
+
+/// Whether no person is at this session: `claude -p` (Claude Code names
+/// its entrypoint `sdk-cli` there, `sdk-ts`/`sdk-py` under the Agent SDK),
+/// a session Claude Code marks unattended, an agent Cork's wake watcher
+/// started, `codex exec`, or CI. Nothing that asks the user a question is
+/// said to one: there is nobody to ask (Study 8's headless agents were each
+/// offered to add a section to AGENTS.md "if the user says yes").
+/// `CORK_HEADLESS=1`/`0` overrides either way.
+pub fn headless(hook_input: &serde_json::Value, env: &crate::config::Env) -> bool {
+    let get = |k: &str| crate::config::get(env, k).trim().to_ascii_lowercase();
+    match get("CORK_HEADLESS").as_str() {
+        "1" | "true" => return true,
+        "0" | "false" => return false,
+        _ => {}
+    }
+    let entry = get("CLAUDE_CODE_ENTRYPOINT");
+    if entry.starts_with("sdk") || matches!(entry.as_str(), "headless" | "print" | "github-action") {
+        return true;
+    }
+    if matches!(get("CLAUDE_CODE_SESSION_ATTENDED").as_str(), "0" | "false") {
+        return true;
+    }
+    if !get("CORK_WOKEN").is_empty() || !get("CI").is_empty() || !get("GITHUB_ACTIONS").is_empty() {
+        return true;
+    }
+    // Codex names a non-interactive run in its hook input
+    let source = hook_input.get("source").and_then(serde_json::Value::as_str).unwrap_or("");
+    current() == "codex" && matches!(source, "exec" | "headless")
 }
 
 fn event_name(harness: &str, event: &str) -> String {
@@ -107,7 +136,10 @@ fn first_string(map: &Map<String, Value>, keys: &[&str]) -> String {
 /// A foreign harness's payload in the canonical shape.
 pub fn normalize(payload: Value) -> Value {
     let harness = current();
-    if harness == "claude" || harness == "codex" {
+    if harness == "codex" {
+        return codex_shell(payload);
+    }
+    if harness == "claude" {
         return payload;
     }
     let Some(map) = payload.as_object() else { return payload };
@@ -178,13 +210,44 @@ pub fn normalize(payload: Value) -> Value {
     Value::Object(out)
 }
 
+/// Codex's terminal tool takes its command as `cmd` (a string, or an argv
+/// like `["bash", "-lc", "…"]`) and may run it in a `workdir` of its own;
+/// in Claude Code's shape that is `command`, run in `cwd`. Everything else
+/// Codex sends already is Claude Code's.
+fn codex_shell(mut payload: Value) -> Value {
+    let Some(input) = payload.get_mut("tool_input").and_then(Value::as_object_mut) else { return payload };
+    if !input.contains_key("command") {
+        let command = match input.get("cmd") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(argv)) => {
+                let words: Vec<&str> = argv.iter().filter_map(Value::as_str).collect();
+                match words.as_slice() {
+                    [shell, flag, script] if flag.starts_with('-') && flag.contains('c') && !shell.is_empty() => script.to_string(),
+                    _ => words.join(" "),
+                }
+            }
+            _ => String::new(),
+        };
+        if !command.is_empty() {
+            input.insert("command".into(), json!(command));
+        }
+    }
+    let workdir = input.get("workdir").and_then(Value::as_str).unwrap_or("").to_string();
+    if !workdir.is_empty() && std::path::Path::new(&workdir).is_absolute() {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert("cwd".into(), json!(workdir));
+        }
+    }
+    payload
+}
+
 /// What this harness reads back as context, or empty when it reads nothing.
 ///
 /// Hermes discards a `post_tool_call` return value by design, so there is no
 /// channel there at all; the note stays queued for the next turn rather than
 /// being written into a pipe that throws it away.
 /// Characters this process put into the agent's context. Every one is
-/// carried on every later message, so all of it counts as Collide's cost,
+/// carried on every later message, so all of it counts as Cork's cost,
 /// not only the briefing (report::run settles it per session).
 static INJECTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -233,7 +296,7 @@ pub fn render_decision(allow: bool, reason: &str) -> (String, String, i32) {
                 (json!({"permission": "allow"}).to_string(), String::new(), 0)
             } else {
                 (
-                    json!({"permission": "deny", "user_message": "Collide blocked this write",
+                    json!({"permission": "deny", "user_message": "Cork blocked this write",
                            "agent_message": reason})
                     .to_string(),
                     String::new(),

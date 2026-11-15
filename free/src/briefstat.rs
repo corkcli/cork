@@ -11,7 +11,7 @@
 //! did not send: the search that finds a file (hit, needed, found) and the
 //! read that learns it (hit only). A message not sent would have replayed the
 //! whole context: tokens_saved = messages x the context size at the time,
-//! priced at the model's cache-read rate (a tenth of input). The briefing's
+//! priced at the model's cache-read rate. The briefing's
 //! own cost is counted alongside: its text entered the context once (a cache
 //! write) and rode in every message since (cache reads). Per-scope tallies,
 //! so the ratio and the running saving can sit on the dashboard, and one
@@ -23,6 +23,7 @@ use serde_json::Map;
 
 use serde_json::{json, Value};
 
+use crate::presence::Effort;
 use crate::store::Store;
 
 pub const BUCKET: &str = "briefstat";
@@ -46,8 +47,9 @@ fn round3(x: f64) -> f64 {
 /// A hit saved two messages, the search and the read; needed and found saved
 /// the search; a written file whose callers the briefing listed saved the
 /// callers search. Cache-read, not blended: the message the agent did not
-/// send would have replayed a cached prefix, and a cache read costs a tenth
-/// of the INPUT rate, not a tenth of some input+output blend, which is five
+/// send would have replayed a cached prefix, and a cache read is priced off
+/// the model's own cache-read rate (a twentieth of input on Opus 5.5, a
+/// tenth on most), not a share of some input+output blend, which is five
 /// times more on Opus. Returns (messages, tokens, usd).
 pub fn worth(hits: u64, needed: u64, found: u64, callers: u64, context_tokens: u64, model: &str) -> (u64, u64, f64) {
     let messages = 2 * hits + needed + found + callers;
@@ -63,14 +65,14 @@ pub fn priced(messages: u64, context_tokens: u64, model: &str) -> (u64, u64, f64
 }
 
 /// What the briefing itself cost: `injected` tokens entered the context once
-/// (a cache write, 1.25x input) and `carried` is the sum, over every message
-/// since, of the briefing tokens replayed in it (cache reads, a tenth of
-/// input). Returns (tokens, usd).
+/// (a cache write: Claude Code's main conversation writes for an hour, 2x
+/// input; an OpenAI model's cache-write rate) and `carried` is the sum, over
+/// every message since, of the briefing tokens replayed in it (cache reads,
+/// at the model's cache-read rate). Returns (tokens, usd).
 pub fn cost(injected: u64, carried: u64, model: &str) -> (u64, f64) {
-    let (input, _) = crate::insights::usd_per_mtok(model);
-    let usd = (injected as f64 * crate::insights::CACHE_WRITE_SHARE + carried as f64 * crate::insights::CACHE_READ_SHARE)
-        / 1_000_000.0
-        * input;
+    let usd = (injected as f64 * crate::insights::context_write_usd_per_mtok(model)
+        + carried as f64 * crate::insights::cache_read_usd_per_mtok(model))
+        / 1_000_000.0;
     (injected + carried, usd)
 }
 
@@ -83,36 +85,56 @@ pub struct Outcome<'a> {
     pub callers: u64,
     pub context_tokens: u64,
     pub model: &'a str,
+    /// the effort `model` ran at, kept on the rows beside it
+    pub effort: Effort,
     pub brief_injected: u64,
     pub brief_carried: u64,
+    /// The files of reads the briefing made unnecessary, summed over every
+    /// message since that did not have to carry them.
+    pub read_avoided_carried: u64,
+    /// The same for reads a map answer replaced.
+    pub map_avoided_carried: u64,
 }
 
-/// The context this session was last seen carrying, and on what model: the
-/// per-agent token record first (every report and presence post refreshes
-/// it), then the newest usage-bearing ledger row of the session in the last
-/// day, then the user's newest across sessions (a `collide-hook apply` run
-/// has no session of its own). Zeros when nothing is known. This is what a
-/// saving is priced against when the event itself carries no usage.
-pub fn last_usage(store: &Store, scope: &str, session: &str, user: &str) -> (u64, String) {
+/// Tokens a skipped read did not add to messages since, at the cache-read
+/// rate: (tokens, usd).
+pub fn carried(tokens: u64, model: &str) -> (u64, f64) {
+    (tokens, tokens as f64 / 1_000_000.0 * crate::insights::cache_read_usd_per_mtok(model))
+}
+
+/// The context this session was last seen carrying, and on what model at
+/// what effort: the per-agent token record first (every report and presence
+/// post refreshes it), then the newest usage-bearing ledger row of the
+/// session in the last day, then the user's newest across sessions (a
+/// `cork apply` run has no session of its own). Zeros when nothing
+/// is known. This is what a saving is priced against when the event itself
+/// carries no usage.
+pub fn last_usage(store: &Store, scope: &str, session: &str, user: &str) -> (u64, String, Effort) {
     if !session.is_empty() {
         if let Some(record) = store.eph_get(&crate::presence::tokens_key(scope, user, session)) {
             let context = record.get("context").and_then(Value::as_u64).unwrap_or(0);
             if context > 0 {
-                return (context, record.get("model").and_then(Value::as_str).unwrap_or("").to_string());
+                return (context, record.get("model").and_then(Value::as_str).unwrap_or("").to_string(), Effort::of(&record));
             }
         }
     }
     let stamp = crate::store::now();
     let handle = usage_index(store, scope, stamp);
     let index = handle.lock().unwrap_or_else(|e| e.into_inner());
-    let fresh = |entry: Option<&(f64, u64, String)>| entry.filter(|(ts, _, _)| *ts >= stamp - USAGE_WINDOW_S).map(|(_, c, m)| (*c, m.clone()));
+    let fresh = |entry: Option<&Usage>| {
+        entry.filter(|(ts, _, _, _)| *ts >= stamp - USAGE_WINDOW_S).map(|(_, c, m, e)| (*c, m.clone(), e.clone()))
+    };
     if !session.is_empty() {
         if let Some(found) = fresh(index.by_session.get(session)) {
             return found;
         }
     }
-    fresh(index.by_user.get(user)).unwrap_or((0, String::new()))
+    fresh(index.by_user.get(user)).unwrap_or((0, String::new(), Effort::default()))
 }
+
+/// A usage-bearing row as the index keeps it: when, its context, its model
+/// and the effort that model ran at.
+type Usage = (f64, u64, String, Effort);
 
 /// How far back a usage-bearing row counts.
 const USAGE_WINDOW_S: f64 = 86_400.0;
@@ -124,8 +146,8 @@ const USAGE_WINDOW_S: f64 = 86_400.0;
 struct UsageIndex {
     upto: f64,
     seq: i64,
-    by_session: std::collections::HashMap<String, (f64, u64, String)>,
-    by_user: std::collections::HashMap<String, (f64, u64, String)>,
+    by_session: std::collections::HashMap<String, Usage>,
+    by_user: std::collections::HashMap<String, Usage>,
     used: f64,
 }
 
@@ -164,13 +186,21 @@ fn usage_index(store: &Store, scope: &str, stamp: f64) -> UsageHandle {
                 continue;
             }
             last = last.max(row.seq);
+            // a bill (hooks v72+) sums many messages: its `context` is the
+            // newest one's, and a subagent's bill is the subagent's context
+            if row.payload.get("worker").and_then(Value::as_str).is_some_and(|w| !w.is_empty()) {
+                continue;
+            }
             let usage = crate::insights::row_usage(&row.payload);
-            let context = usage[0] + usage[2] + usage[3];
+            let context = match row.payload.get("context").and_then(Value::as_i64) {
+                Some(given) if given > 0 => given,
+                _ => usage[0] + usage[2] + usage[3],
+            };
             if context <= 0 {
                 continue;
             }
             let model = row.payload.get("model").and_then(Value::as_str).unwrap_or("").to_string();
-            let entry = (row.ts, context as u64, model);
+            let entry = (row.ts, context as u64, model, Effort::of(&row.payload));
             if let Some(session) = row.payload.get("session").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                 index.by_session.insert(session.to_string(), entry.clone());
             }
@@ -192,13 +222,14 @@ fn usage_index(store: &Store, scope: &str, stamp: f64) -> UsageHandle {
 pub fn record_saving(
     store: &Store, scope: &str, kind: &str, user: &str, agent: &str, session: &str, messages: u64, detail: &Value, now: f64,
 ) -> Value {
-    let (context, model) = last_usage(store, scope, session, user);
+    let (context, model, effort) = last_usage(store, scope, session, user);
     let (messages, tokens_saved, est_usd) = priced(messages, context, &model);
     let mut payload = Map::new();
     payload.insert("user".into(), json!(user));
     payload.insert("agent".into(), json!(agent));
     payload.insert("session".into(), json!(session));
     payload.insert("model".into(), json!(model));
+    effort.tag(&mut payload);
     payload.insert("context_tokens".into(), json!(context));
     payload.insert("messages".into(), json!(messages));
     payload.insert("tokens_saved".into(), json!(tokens_saved));
@@ -228,9 +259,66 @@ pub fn row_messages(payload: &Value) -> u64 {
     if payload.get("messages").is_some() { count(payload, "messages") } else { count(payload, "hits") }
 }
 
+/// What one savings row is worth, read the one way every page sums it: the
+/// savings page, its workspace total and the waste report.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RowSaving {
+    pub messages: u64,
+    pub tokens_saved: u64,
+    pub est_usd: f64,
+    /// The briefing's own cost carried on the row (briefing rows only).
+    pub cost_tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// [`RowSaving`] of a ledger row, `None` for a kind that is not a saving.
+///
+/// The dollars are priced here, from the row's tokens and model, at today's
+/// rates: every saving is tokens at the model's cache-read rate and every
+/// briefing cost its injected and carried tokens (see `priced` and `cost`),
+/// so a row written while the price table was wrong reads right once it is
+/// fixed. A row with no model keeps the dollars it was written with.
+pub fn row_saving(kind: &str, payload: &Value) -> Option<RowSaving> {
+    source_of(kind)?;
+    let model = payload.get("model").and_then(Value::as_str).unwrap_or("");
+    let tokens_saved = count(payload, "tokens_saved");
+    let (est_usd, cost_usd) = if model.is_empty() {
+        (float(payload, "est_usd"), float(payload, "brief_cost_usd"))
+    } else {
+        let saved = tokens_saved as f64 / 1_000_000.0 * crate::insights::cache_read_usd_per_mtok(model);
+        let cost = if payload.get("brief_injected").is_some() || payload.get("brief_carried").is_some() {
+            cost(count(payload, "brief_injected"), count(payload, "brief_carried"), model).1
+        } else {
+            float(payload, "brief_cost_usd")
+        };
+        (saved, cost)
+    };
+    Some(RowSaving {
+        messages: row_messages(payload),
+        tokens_saved,
+        est_usd,
+        cost_tokens: count(payload, "brief_cost_tokens"),
+        cost_usd,
+    })
+}
+
 pub fn record(store: &Store, scope: &str, user: &str, agent: &str, session: &str, outcome: &Outcome, now: f64) -> Value {
-    let (messages, tokens_saved, est_usd) =
+    let (messages, sent_saved, sent_usd) =
         worth(outcome.hits, outcome.needed, outcome.found, outcome.callers, outcome.context_tokens, outcome.model);
+    // the reads not sent would also have stayed in the context: every later
+    // message carried their files, the cost the briefing's own text is
+    // charged the same way
+    let (avoided_tokens, avoided_usd) = carried(outcome.read_avoided_carried, outcome.model);
+    let (tokens_saved, est_usd) = (sent_saved + avoided_tokens, sent_usd + avoided_usd);
+    if outcome.map_avoided_carried > 0 {
+        let (tokens, usd) = carried(outcome.map_avoided_carried, outcome.model);
+        let mut row = json!({
+            "user": user, "agent": agent, "session": session, "model": outcome.model,
+            "messages": 0, "carried": tokens, "tokens_saved": tokens, "est_usd": usd,
+        });
+        outcome.effort.tag_value(&mut row);
+        store.ledger_append_later(scope, "map_answered", &row, now);
+    }
     let (brief_cost_tokens, brief_cost_usd) = cost(outcome.brief_injected, outcome.brief_carried, outcome.model);
     let tally = store.kv_get(BUCKET, scope).unwrap_or_else(|| json!({}));
     let updated = json!({
@@ -249,17 +337,14 @@ pub fn record(store: &Store, scope: &str, user: &str, agent: &str, session: &str
         "last_ts": now,
     });
     let _ = store.kv_put(BUCKET, scope, &updated, now);
-    let _ = store.ledger_append(
-        scope,
-        "brief_outcome",
-        &json!({"user": user, "agent": agent, "session": session,
-                "hits": outcome.hits, "misses": outcome.misses, "needed": outcome.needed, "found": outcome.found,
-                "callers": outcome.callers, "messages": messages, "context_tokens": outcome.context_tokens, "model": outcome.model,
-                "tokens_saved": tokens_saved, "est_usd": est_usd,
-                "brief_injected": outcome.brief_injected, "brief_carried": outcome.brief_carried,
-                "brief_cost_tokens": brief_cost_tokens, "brief_cost_usd": brief_cost_usd}),
-        now,
-    );
+    let mut row = json!({"user": user, "agent": agent, "session": session,
+            "hits": outcome.hits, "misses": outcome.misses, "needed": outcome.needed, "found": outcome.found,
+            "callers": outcome.callers, "messages": messages, "context_tokens": outcome.context_tokens, "model": outcome.model,
+            "tokens_saved": tokens_saved, "est_usd": est_usd, "carried": avoided_tokens,
+            "brief_injected": outcome.brief_injected, "brief_carried": outcome.brief_carried,
+            "brief_cost_tokens": brief_cost_tokens, "brief_cost_usd": brief_cost_usd});
+    outcome.effort.tag_value(&mut row);
+    let _ = store.ledger_append(scope, "brief_outcome", &row, now);
     stats(store, scope)
 }
 
@@ -283,7 +368,7 @@ pub fn stats(store: &Store, scope: &str) -> Value {
 /// Every saving in the window, newest first, from every source: the
 /// briefing tally, grep answers from the map, deltas delivered, batches
 /// applied. Totals, a per-source breakdown and a per-day series — the page
-/// behind the dashboard's counter. Word for word the Python shape.
+/// behind the dashboard's counter.
 pub fn savings(store: &Store, scope: &str, days: f64) -> Value {
     savings_across(store, &[scope.to_string()], days)
 }
@@ -316,26 +401,26 @@ pub fn savings_across(store: &Store, scopes: &[String], days: f64) -> Value {
     for (repo, row) in &rows {
         let p = &row.payload;
         let source = source_of(&row.kind).unwrap_or("briefings");
-        let (h, n, m, f, c, t) = (
-            count(p, "hits"), count(p, "needed"), count(p, "misses"), count(p, "found"), count(p, "callers"), count(p, "tokens_saved"),
-        );
-        let msgs = row_messages(p);
-        let usd = float(p, "est_usd");
+        let worth = row_saving(&row.kind, p).unwrap_or_default();
+        let (h, n, m, f, c) = (count(p, "hits"), count(p, "needed"), count(p, "misses"), count(p, "found"), count(p, "callers"));
+        let (msgs, t, usd) = (worth.messages, worth.tokens_saved, worth.est_usd);
         hits += h; needed += n; misses += m; found += f; callers += c; messages += msgs; tokens_saved += t;
         est_usd += usd;
-        brief_cost_tokens += count(p, "brief_cost_tokens");
-        brief_cost_usd += float(p, "brief_cost_usd");
+        brief_cost_tokens += worth.cost_tokens;
+        brief_cost_usd += worth.cost_usd;
         let slot = per_source.entry(source).or_insert((0, 0, 0, 0.0));
         slot.0 += 1; slot.1 += msgs; slot.2 += t; slot.3 += usd;
         *by_day.entry(crate::insights::day_key(row.ts)).or_insert(0) += t;
         let mine = per_repo.entry(repo.clone()).or_insert((0, 0, 0.0));
         mine.0 += msgs; mine.1 += t; mine.2 += usd;
+        let effort = Effort::of(p);
         out.push(json!({
             "ts": row.ts, "seq": row.seq, "source": source, "repo": repo,
             "user": p.get("user").and_then(Value::as_str).unwrap_or(""),
             "agent": p.get("agent").and_then(Value::as_str).unwrap_or(""),
             "session": p.get("session").and_then(Value::as_str).unwrap_or(""),
             "model": p.get("model").and_then(Value::as_str).unwrap_or(""),
+            "effort": effort.effort, "ultracode": effort.ultracode,
             "hits": h, "needed": n, "misses": m, "found": f, "callers": c, "messages": msgs,
             "context_tokens": count(p, "context_tokens"), "tokens_saved": t, "est_usd": round3(usd),
             "brief_cost_usd": round3(float(p, "brief_cost_usd")),
@@ -382,21 +467,38 @@ fn by_repo(per_repo: BTreeMap<String, (u64, u64, f64)>) -> Vec<Value> {
         .collect()
 }
 
-/// What the numbers mean, word for word on both halves and printed under the
-/// savings page.
-pub const HOW: &str = "Every unit is a message the agent did not send. A message not sent would have replayed the whole context the agent was carrying, priced at the model's cache-read rate (a tenth of input). The briefings' own cost, entering the context once and riding along in every message since, is counted beside the saving. Still a floor: what an agent would have done without Collide is estimated at the least it could have been.";
+/// What the numbers mean, printed under the savings page.
+pub const HOW: &str = "Every unit is a message the agent did not send. A message not sent would have replayed the whole context the agent was carrying, priced at the model's cache-read rate. A read not sent would also have stayed in the context: its file rides in every later message until it is read after all or a compaction drops it, priced the same way. The briefings' own cost, entering the context once and riding along in every message since, is counted beside the saving. Still a floor: what an agent would have done without Cork is estimated at the least it could have been.";
 
-/// What one source counts, word for word on both halves.
+/// What one source counts.
 pub fn source_how(source: &str) -> &'static str {
     match source {
-        "briefings" => "A briefed file written without a read (hit) saved the search that finds a file and the read that learns it; read first, then written (needed) saved the search, since the Edit tool insists on its own read; a file the briefing only named, then written (found) saved the search; a briefed file whose callers the briefing listed, then written (callers) saved the callers search. A briefed file read and never written (miss) saved nothing.",
-        "map" => "A grep the map answered in the same step, with the symbol's signature, docstring and callers: the read of that file, not sent.",
+        "briefings" => "A briefed file written without a read (hit) saved the search that finds a file and the read that learns it; read first, then written (needed) saved the search, since the Edit tool insists on its own read; a file the briefing only named, then written (found) saved the search; a briefed file whose callers the briefing listed, then written (callers) saved the callers search. A briefed file read and never written (miss) saved nothing. The file of a hit, never read, is also counted in every message since that did not carry it.",
+        "map" => "A grep the map answered in the same step, with the symbol's signature, docstring and callers: the read of that file, not sent, and that file in every message since, until the agent reads it after all.",
         "deltas" => "A teammate's change in what this session was working on, delivered into the session as it happened: the re-read that would have caught it, not sent, once per change.",
         "traffic" => "A group of work plan_work held because another agent was in its way, released when they finished: a collision that did not happen, worth at least the re-read and the re-edit it would have cost, two messages.",
         "claims" => "A new numbered file the gate stopped because another agent already held that number, and moved to the next free one: a clash that did not happen, worth at least the re-read and the rename it would have cost, two messages.",
         "setup" => "A setup done by one command: every file it wrote would have been a message of its own, and every file it merged into (settings, .mcp.json, AGENTS.md, .gitignore) a read before that write, less the one command that did it.",
-        "landing" => "A push collide-hook land made for the agent: each time it rebased onto teammates' new commits was at least the rejected push, the pull and the test run the agent would have sent, three messages; each of the agent's files it adapted to a teammate's landed rename, the read and the edit.",
-        "recipes" => "A typed-op batch collide-hook apply wrote and verified: every file landed without the agent reading or editing it, two messages a file less the one command that did it. A replayed recipe reused another agent's whole transformation.",
+        "landing" => "A push cork land made for the agent: each time it rebased onto teammates' new commits was at least the rejected push, the pull and the test run the agent would have sent, three messages; each of the agent's files it adapted to a teammate's landed rename, the read and the edit.",
+        "recipes" => "A typed-op batch cork apply wrote and verified: every file landed without the agent reading or editing it, two messages a file less the one command that did it. A replayed recipe reused another agent's whole transformation.",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    #[test]
+    fn a_saving_is_priced_and_shown_at_the_effort_the_session_last_ran_at() {
+        let store = Store::open(std::path::Path::new(":memory:")).expect("store");
+        let (scope, user, session) = ("w:github.com/acme/a", "k@x.io", "s1");
+        let xhigh = Effort { effort: "xhigh".into(), ultracode: true };
+        crate::presence::bump_tokens(&store, scope, user, session, 10, "t1", 50_000, "claude-opus-5-5", &xhigh);
+        assert_eq!(last_usage(&store, scope, session, user), (50_000, "claude-opus-5-5".to_string(), xhigh));
+        record_saving(&store, scope, "deltas_delivered", user, "claude-code", session, 1, &json!({}), crate::store::now());
+        let rows = savings(&store, scope, 1.0)["rows"].clone();
+        assert_eq!((rows[0]["model"].clone(), rows[0]["effort"].clone(), rows[0]["ultracode"].clone()),
+                   (json!("claude-opus-5-5"), json!("xhigh"), json!(true)), "{rows}");
     }
 }

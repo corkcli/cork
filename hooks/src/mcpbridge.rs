@@ -1,13 +1,13 @@
-//! `collide mcp`: Collide's MCP tools for the agents on this machine, over
+//! `cork mcp`: Cork's MCP tools for the agents on this machine, over
 //! stdio. The local server already serves MCP at `/mcp`; agent tools start
 //! MCP servers as programs, so this relays each line the agent writes to
 //! that endpoint and writes back what it answers. The server is started when
 //! it is not running, and a server that restarted (an update replaces it)
 //! gets a fresh session, opened the way the agent opened the first.
 //!
-//! In a repo that works with a team the same relay talks to Collide's cloud
+//! In a repo that works with a team the same relay talks to Cork's cloud
 //! instead, with the credential the machine already holds: one sign-in
-//! (`collide login`, or the code `setup` hands out) covers hooks and tools.
+//! (`cork login`, or the code `setup` hands out) covers hooks and tools.
 //!
 //! A relay, not a request/response loop: every message the agent sends is
 //! posted at once on its own thread, and every event the server streams
@@ -40,7 +40,7 @@ enum Sent {
 
 struct Relay {
     env: Env,
-    /// Collide's cloud, with this machine's own credential, when the repo
+    /// Cork's cloud, with this machine's own credential, when the repo
     /// (or the machine) works with a team; None: the local server
     cloud: Option<(String, String)>,
     out: Mutex<std::io::Stdout>,
@@ -97,6 +97,7 @@ impl Relay {
         if !session.is_empty() {
             request = request.set("Mcp-Session-Id", &session);
         }
+        crate::http::audit_raw("POST", &format!("{base}/mcp"), body);
         let response = match request.send_string(body) {
             Ok(response) => response,
             Err(ureq::Error::Status(404, _)) | Err(ureq::Error::Transport(_)) => return Sent::Gone,
@@ -190,8 +191,8 @@ impl Relay {
         }
         let why = match sent {
             Sent::Done => return,
-            Sent::Gone => "Collide's local server is not running".to_string(),
-            Sent::Failed(why) => format!("Collide's local server: {why}"),
+            Sent::Gone => "Cork's local server is not running".to_string(),
+            Sent::Failed(why) => format!("Cork's local server: {why}"),
         };
         if wanted.is_some() {
             self.write(&failure(message, &why));
@@ -200,7 +201,7 @@ impl Relay {
 }
 
 /// Where this session's MCP tools live: a repo (or a machine) that works
-/// with a team talks to Collide's cloud with the credential the machine
+/// with a team talks to Cork's cloud with the credential the machine
 /// already holds, so connecting the tools needs no sign-in of its own;
 /// everything else talks to the local server.
 fn cloud_target(env: &Env) -> Option<(String, String)> {
@@ -218,11 +219,42 @@ fn cloud_target(env: &Env) -> Option<(String, String)> {
     crate::machine::cloud_account(env)
 }
 
+/// The repo id of the checkout these tools were started in ("" outside one).
+fn checkout_repo_id(env: &Env) -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let project = crate::config::get(env, "CLAUDE_PROJECT_DIR");
+    let project = (!project.is_empty()).then(|| std::path::PathBuf::from(project));
+    crate::config::find_repo_root(&[Some(cwd), project])
+        .map(|root| crate::config::config(Some(&root), env).repo_id)
+        .unwrap_or_default()
+}
+
+/// A tool call that names no repo runs in this session's checkout: every
+/// Cork tool takes `repo_id`, and agents went hunting for it (v76).
+/// The line as it was when there is nothing to fill in.
+fn with_repo_id(message: &Value, repo_id: &str) -> Option<String> {
+    if repo_id.is_empty() || message.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let given = message.pointer("/params/arguments/repo_id").and_then(Value::as_str).unwrap_or("");
+    if !given.trim().is_empty() {
+        return None;
+    }
+    let mut filled = message.clone();
+    let params = filled.get_mut("params")?.as_object_mut()?;
+    let args = params.entry("arguments").or_insert_with(|| json!({}));
+    args.as_object_mut()?.insert("repo_id".into(), json!(repo_id));
+    Some(filled.to_string())
+}
+
 pub fn run(env: &Env) -> i32 {
     let cloud = cloud_target(env);
+    let repo_id = checkout_repo_id(env);
     if cloud.is_none() {
         ensure_local(env, Duration::from_secs(8));
     }
+    // open as long as the agent session: brings Cork into agent tools installed since
+    crate::harnesses::watch(env.clone());
     let relay = Arc::new(Relay {
         env: env.clone(),
         cloud,
@@ -256,12 +288,19 @@ pub fn run(env: &Env) -> i32 {
             continue;
         }
         // the first tool call maps the repo it is made from, as the first
-        // hook call does: an agent that reaches Collide only through these
+        // hook call does: an agent that reaches Cork only through these
         // tools still gets a graph, once per repo and server on this machine
         if !mapped && method == "tools/call" {
             mapped = true;
             crate::machine::index_here(env);
         }
+        let (line, message) = match with_repo_id(&message, &repo_id) {
+            Some(filled) => {
+                let parsed = serde_json::from_str::<Value>(&filled).unwrap_or(message);
+                (filled, parsed)
+            }
+            None => (line, message),
+        };
         running.retain(|t| !t.is_finished());
         let relay = Arc::clone(&relay);
         running.push(std::thread::spawn(move || relay.handle(&line, &message)));
@@ -281,6 +320,24 @@ fn failure(message: &Value, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_call_without_a_repo_runs_in_the_sessions_checkout() {
+        let call = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_symbol", "arguments": {"path": "a.py"}}});
+        let filled = with_repo_id(&call, "github.com/acme/app").expect("filled");
+        let filled: Value = serde_json::from_str(&filled).unwrap();
+        assert_eq!(filled["params"]["arguments"]["repo_id"], "github.com/acme/app");
+        assert_eq!(filled["params"]["arguments"]["path"], "a.py");
+        // a call that names its repo, another method, or no checkout: untouched
+        let named = json!({"method": "tools/call", "params": {"name": "recap", "arguments": {"repo_id": "x/y"}}});
+        assert!(with_repo_id(&named, "github.com/acme/app").is_none());
+        assert!(with_repo_id(&json!({"method": "tools/list"}), "github.com/acme/app").is_none());
+        assert!(with_repo_id(&call, "").is_none());
+        // no arguments at all
+        let bare = json!({"method": "tools/call", "params": {"name": "recap"}});
+        let filled: Value = serde_json::from_str(&with_repo_id(&bare, "r/s").unwrap()).unwrap();
+        assert_eq!(filled["params"]["arguments"]["repo_id"], "r/s");
+    }
 
     #[test]
     fn events_are_handed_on_as_they_end_and_reading_stops_at_the_answer() {

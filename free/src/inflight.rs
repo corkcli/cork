@@ -89,23 +89,43 @@ fn author_for(store: &Store, reader: &str, author: &str) -> String {
 
 /// Queue one notice for `session`, once per (path, author) pair.
 #[allow(clippy::too_many_arguments)]
-fn queue(
+pub(crate) fn queue(
     store: &Store, scope: &str, reader: &str, session: &str, path: &str, author: &str, author_session: &str,
     new_file: bool, iface: &str,
 ) {
     if session.is_empty() || (author == reader && author_session == session) {
         return;
     }
-    let who = author_for(store, reader, author);
+    // one working copy: nothing of theirs is "not pushed yet" to this one
+    if crate::freshness::same_copy(store, scope, (reader, session), (author, author_session)) {
+        return;
+    }
+    let mut who = author_for(store, reader, author);
+    // work on another branch reaches this one only when the branches merge
+    // (branches.rs): neither landing nor a pull brings it in
+    let mine = crate::branches::of(store, scope, reader, session);
+    let elsewhere = crate::branches::apart(store, scope, &mine, (author, author_session));
+    if let Some(on) = &elsewhere {
+        who = format!("{who} (on branch {on})");
+    }
+    // a session whose pushes land through Cork never needs to pull it:
+    // its push rebases onto it
+    let then = if elsewhere.is_some() {
+        "it reaches your branch when the branches merge."
+    } else if crate::freshness::lands(store, scope, reader, session) {
+        "landing will rebase onto it once it lands."
+    } else {
+        "pull when it lands (Cork says when origin moves)."
+    };
     let mut text = if new_file {
         format!(
-            "Collide in flight: {path} is new work by {who}, probably not on main yet, and your code imports it. \
-Build against its interface instead of waiting or writing your own copy; pull when it lands (Collide says when origin moves)."
+            "Cork in flight: {path} is new work by {who}, probably not on main yet, and your code imports it. \
+Build against its interface instead of waiting or writing your own copy; {then}"
         )
     } else {
         format!(
-            "Collide in flight: {who} is adding to {path} what your code takes from it, probably not on main yet. \
-Build against it instead of waiting or writing your own; pull when it lands (Collide says when origin moves)."
+            "Cork in flight: {who} is adding to {path} what your code takes from it, probably not on main yet. \
+Build against it instead of waiting or writing your own; {then}"
         )
     };
     if !iface.is_empty() {
@@ -119,6 +139,76 @@ Build against it instead of waiting or writing your own; pull when it lands (Col
         &json!({"path": path, "text": text, "author": author, "author_session": author_session}),
         Some(INFLIGHT_TTL_S),
     );
+}
+
+/// Another agent's unpushed new work in `path` (a file new to the repo, or
+/// names a write added to it), for the gate: who, which names, and their
+/// signatures as the author reported them. A hold on code a teammate is
+/// creating becomes "build against its interface" (hooks v78): v76 said
+/// "wait for them to land it", and an agent deleted its copy of the module
+/// and rebuilt it (25 calls).
+pub fn creating(store: &Store, scope: &str, reader: &str, session: &str, path: &str) -> Option<Value> {
+    let mut found: Option<(f64, Value)> = None;
+    for (_, entry) in store.eph_scan(&entry_prefix(scope, path)) {
+        let author = entry.get("user").and_then(Value::as_str).unwrap_or("");
+        let author_session = entry.get("session").and_then(Value::as_str).unwrap_or("");
+        if author_session == session && author == reader {
+            continue;
+        }
+        // one working copy: what it is creating is already on this disk
+        if crate::freshness::same_copy(store, scope, (reader, session), (author, author_session)) {
+            continue;
+        }
+        let names: Vec<String> = entry
+            .get("names").and_then(Value::as_array).into_iter().flatten()
+            .filter_map(|v| v.as_str().map(str::to_string)).collect();
+        if names.is_empty() {
+            continue;
+        }
+        let ts = entry.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
+        if found.as_ref().is_some_and(|(at, _)| *at >= ts) {
+            continue;
+        }
+        let sigs = entry.get("sigs").cloned().unwrap_or(json!({}));
+        let shown: Vec<String> = names
+            .iter()
+            .map(|n| sigs.get(n).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| n.clone()))
+            .collect();
+        let more = shown.len().saturating_sub(MAX_SIGNATURES);
+        let mut iface = shown.into_iter().take(MAX_SIGNATURES).collect::<Vec<_>>().join("; ");
+        if more > 0 {
+            iface.push_str(&format!("; … {more} more"));
+        }
+        found = Some((ts, json!({
+            "who": author_for(store, reader, author),
+            "session": author_session,
+            "new_file": entry.get("new_file").and_then(Value::as_bool).unwrap_or(false),
+            "names": names,
+            "interface": iface,
+        })));
+    }
+    found.map(|(_, v)| v)
+}
+
+/// The line a write gets about code a teammate is creating, in place of a
+/// hold: its interface so far, and never "wait".
+pub fn build_against_line(who: &str, path: &str, names: &[String], new_file: bool, iface: &str) -> String {
+    let what = if new_file {
+        format!("{path} is new work by {who}")
+    } else {
+        let shown: Vec<String> = names.iter().take(4).map(|n| format!("`{n}`")).collect();
+        format!("{who} is adding {} to {path}", shown.join(", "))
+    };
+    let mut line = format!(
+        "Cork in flight: {what}, not pushed yet. Build against its interface instead of writing your own copy: import it and keep your edit to your own code; landing will rebase onto it once it lands."
+    );
+    if !iface.is_empty() {
+        line.push_str(&format!(" Interface: {iface}"));
+    }
+    if line.chars().count() > MAX_NOTICE_CHARS {
+        line = line.chars().take(MAX_NOTICE_CHARS - 1).collect::<String>() + "…";
+    }
+    line
 }
 
 /// What an import takes by name: original names, not aliases or `*`.
@@ -164,10 +254,18 @@ pub fn on_write(
         names.extend(new_names.iter().cloned());
         let new_file = !was_known
             || store.eph_get(&key).and_then(|e| e.get("new_file").and_then(Value::as_bool)).unwrap_or(false);
+        // the author's own signatures: the graph holds whoever wrote last
+        let sigs: Map<String, Value> = names
+            .iter()
+            .filter_map(|n| {
+                let sig = symbols.get(n)?.get("signature").and_then(Value::as_str).unwrap_or("");
+                (!sig.is_empty()).then(|| (n.clone(), json!(sig)))
+            })
+            .collect();
         let _ = store.eph_set(
             &key,
             &json!({"path": path, "user": user, "session": session, "ts": stamp, "new_file": new_file,
-                    "names": names.iter().collect::<Vec<_>>()}),
+                    "names": names.iter().collect::<Vec<_>>(), "sigs": sigs}),
             Some(INFLIGHT_TTL_S),
         );
         // whoever was waiting for these names in this file
@@ -191,7 +289,7 @@ pub fn on_write(
                 let importer = waiting.get("importer").and_then(Value::as_str).unwrap_or("");
                 let lang = waiting.get("language").and_then(Value::as_str).unwrap_or("");
                 let hits = crate::codegraph::with_known(store, scope, |known| {
-                    collide_core::graph::resolve_module(module, importer, lang, known).as_deref() == Some(path)
+                    cork_core::graph::resolve_module(module, importer, lang, known).as_deref() == Some(path)
                 });
                 if !hits {
                     continue;
@@ -213,7 +311,7 @@ pub fn on_write(
         }
         let taken = taken_names(import);
         let target = crate::codegraph::with_known(store, scope, |known| {
-            collide_core::graph::resolve_module(module, path, language, known)
+            cork_core::graph::resolve_module(module, path, language, known)
         });
         match target {
             Some(target) if target != path => {
@@ -280,14 +378,14 @@ pub fn on_write(
 pub fn queue_task_match(
     store: &Store, scope: &str, reader: &str, session: &str, path: &str, author: &str, author_session: &str,
 ) {
-    if session.is_empty() {
+    if session.is_empty() || crate::freshness::same_copy(store, scope, (reader, session), (author, author_session)) {
         return;
     }
     let who = author_for(store, reader, author);
     let iface = interface(&crate::codegraph::symbols_of(store, scope, path), None);
     let mut text = format!(
-        "Collide: {who} just started {path}, and it matches what you are working on. It is not pushed yet: build \
-against its interface, or keep to your own part until it lands (Collide says when origin moves)."
+        "Cork: {who} just started {path}, and it matches what you are working on. It is not pushed yet: build \
+against its interface, or keep to your own part until it lands (Cork says when origin moves)."
     );
     if !iface.is_empty() {
         text.push_str(&format!(" Interface: {iface}"));
@@ -326,7 +424,7 @@ pub fn queue_notice(
     crate::deltas::touch(store, scope, session, paths, crate::store::now());
 }
 
-/// The author's work landed (`collide-hook land` pushed it): nothing of it is
+/// The author's work landed (`cork land` pushed it): nothing of it is
 /// in flight any more. Its entries go, and so do notices about it not yet
 /// read; Study 5 told an agent a module was "probably not on main yet" 45s
 /// after it was pushed and 26s after that agent had pulled it.
@@ -403,6 +501,21 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_knows_what_a_teammate_is_creating_with_their_signatures() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        write(&db, "b6", "billing/credits.py", "python", &["balance_for"], json!([]), &[]);
+        // the author's own signatures, even after another copy is indexed over it
+        crate::codegraph::update_file(&db, "w:r", "billing/credits.py", record("billing/credits.py", "python", &["unused_credits"]), 2.0);
+        let found = creating(&db, "w:r", "u", "b7", "billing/credits.py").expect("in flight");
+        assert_eq!(found["new_file"], true);
+        assert_eq!(found["interface"], "def balance_for()");
+        assert!(creating(&db, "w:r", "u", "b6", "billing/credits.py").is_none(), "not to its author");
+        let line = build_against_line("another session of yours", "billing/credits.py", &["balance_for".into()], true, "def balance_for()");
+        assert!(line.starts_with("Cork in flight: billing/credits.py is new work by another session of yours, not pushed yet. Build against its interface"), "{line}");
+        assert!(!line.to_lowercase().contains("wait"), "{line}");
+    }
+
+    #[test]
     fn a_function_added_to_an_existing_file_reaches_whoever_imports_it() {
         let db = Store::open(std::path::Path::new(":memory:")).unwrap();
         // existing code: indexed, not written by anyone in flight
@@ -447,4 +560,21 @@ mod tests {
         let agent = crate::presence::agent_id("u", "busy");
         assert!(db.eph_scan(&format!("waitspec:w:r:{}:", short_hash(&agent))).len() <= MAX_WAITING);
     }
+
+    /// A person's earlier session in the same folder: what it created is on
+    /// this disk already, never "in flight, not pushed yet" to the next.
+    #[test]
+    fn work_in_the_same_folder_is_never_in_flight_to_it() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let scope = "ws:lattice";
+        let _ = db.eph_set(&format!("{}x", entry_prefix(scope, "static/js/issue.js")),
+            &json!({"user": "kevin@x.com", "session": "old", "names": ["mountIssue"], "ts": crate::store::now()}), Some(600.0));
+        assert!(creating(&db, scope, "kevin@x.com", "new", "static/js/issue.js").is_some(), "unknown folders: said");
+        crate::freshness::note_checkout(&db, scope, "kevin@x.com", "old", "checkout-1");
+        crate::freshness::note_checkout(&db, scope, "kevin@x.com", "new", "checkout-1");
+        assert!(creating(&db, scope, "kevin@x.com", "new", "static/js/issue.js").is_none(), "one folder: on disk already");
+        crate::freshness::note_checkout(&db, scope, "kevin@x.com", "new", "checkout-2");
+        assert!(creating(&db, scope, "kevin@x.com", "new", "static/js/issue.js").is_some(), "another clone: still news");
+    }
+
 }

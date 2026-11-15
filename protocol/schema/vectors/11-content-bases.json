@@ -1,0 +1,207 @@
+{
+  "name": "Bases by content hash",
+  "description": "A hook knows the source on disk, not versions. It names its base by content (base.content) and says what its op produces (content_hash). The server maps content to versions: the first op records version 0's content; a writer still on that content conflicts; a writer on the newer content lands; unknown content on a known key shows as unknown_base in check.",
+  "steps": [
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "session": "alice-1"
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "bob-1",
+        "agent_id": "codex-b",
+        "person": "bob@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "welcome",
+            "session": "bob-1"
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "carol",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "carol-1",
+        "agent_id": "claude-c",
+        "person": "carol@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "carol",
+          "recv": {
+            "t": "welcome",
+            "session": "carol-1"
+          }
+        }
+      ]
+    },
+    {
+      "at": 1,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "",
+          "content": "sha256:aa"
+        },
+        "kind": "modify_body",
+        "content_hash": "sha256:bb",
+        "hlc": {
+          "w": 1,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "at": 2,
+      "conn": "bob",
+      "send": {
+        "t": "check",
+        "req": "q",
+        "keys": [
+          {
+            "key": "code:src/cli.py::parse_config",
+            "base": {
+              "version": 0,
+              "hash": "",
+              "content": "sha256:aa"
+            },
+            "kind": "modify_body"
+          },
+          {
+            "key": "code:src/cli.py::parse_config",
+            "base": {
+              "version": 0,
+              "hash": "",
+              "content": "sha256:zz"
+            },
+            "kind": "modify_body"
+          }
+        ]
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "check_result",
+            "req": "q",
+            "results": [
+              {
+                "status": "stale",
+                "would": "conflict"
+              },
+              {
+                "status": "unknown_base"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 3,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "",
+          "content": "sha256:aa"
+        },
+        "kind": "modify_body",
+        "content_hash": "sha256:cc",
+        "hlc": {
+          "w": 3,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "reject",
+            "reason": "conflict",
+            "theirs": [
+              {
+                "op_id": "alice-1.1"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "at": 4,
+      "conn": "carol",
+      "send": {
+        "t": "op",
+        "op_id": "carol-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "",
+          "content": "sha256:bb"
+        },
+        "kind": "modify_body",
+        "content_hash": "sha256:dd",
+        "hlc": {
+          "w": 4,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "carol",
+          "recv": {
+            "t": "ack",
+            "version": 2
+          }
+        }
+      ]
+    }
+  ]
+}

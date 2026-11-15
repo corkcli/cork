@@ -1,6 +1,6 @@
 //! collide-watch: the disk-confirmed reporter.
 //!
-//! The only Collide component that reads files off disk on its own, and it
+//! The only Cork component that reads files off disk on its own, and it
 //! runs on the developer's machine by their choice. It covers the case hooks
 //! cannot: a human editing in an editor, with no agent in the loop. Edits it
 //! reports carry the `collide-watch` identity, which the server treats as
@@ -177,9 +177,8 @@ fn default_state_file(root: &Path, repo_id: &str) -> PathBuf {
 
 fn report(options: &Options, changes: &[(String, String)]) -> usize {
     let mut reported = 0;
-    // the same local-parse switch the hooks read: the repo's config, or
-    // COLLIDE_LOCAL_PARSE for this process
-    let local = crate::config::config(Some(&options.root), &crate::config::env_map()).local_parse;
+    // the file's structure, never its text (hooks v75: the only mode)
+    crate::privacy::note_root(&options.root);
     for (path, content) in changes {
         let mut payload = json!({
             "repo_id": options.repo_id,
@@ -189,11 +188,7 @@ fn report(options: &Options, changes: &[(String, String)]) -> usize {
             "agent": "collide-watch",
         });
         if let Some(map) = payload.as_object_mut() {
-            if local {
-                map.extend(collide_core::local::fields(path, content));
-            } else {
-                map.insert("content".into(), json!(content));
-            }
+            map.extend(cork_core::local::fields(path, content));
         }
         match http::post(
             &options.server,
@@ -235,9 +230,9 @@ pub fn run(options: Options, env: &Env) -> i32 {
 
 pub fn parse_args(args: &[String], env: &Env) -> Result<Options, String> {
     let mut root = std::env::current_dir().unwrap_or_default();
-    let mut repo_id = config::get(env, "COLLIDE_REPO_ID").to_string();
-    let mut server = config::get(env, "COLLIDE_SERVER_URL").to_string();
-    let mut token = config::get(env, "COLLIDE_TOKEN").to_string();
+    let mut repo_id = config::get(env, "CORK_REPO_ID").to_string();
+    let mut server = config::get(env, "CORK_SERVER_URL").to_string();
+    let mut token = config::get(env, "CORK_TOKEN").to_string();
     let mut interval = Duration::from_secs(5);
     let mut once = false;
     let mut state_file = None;

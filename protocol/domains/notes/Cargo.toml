@@ -1,0 +1,14 @@
+[package]
+name = "cork-protocol-notes"
+version = "0.1.0"
+edition = "2021"
+description = "The notes domain for cork-protocol: keys are notes, the graph is links. A fast stream: coalescing on."
+license = "MIT"
+
+[lib]
+name = "cork_protocol_notes"
+path = "src/lib.rs"
+
+[dependencies]
+cork-protocol = { path = "../../core" }
+serde_json = "1"

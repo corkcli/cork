@@ -67,7 +67,7 @@ fn test_runners(root: &Path, tests: &[String], env: &Env) -> (Vec<Run>, Vec<Stri
 
     let py: Vec<String> = sorted.iter().filter(|t| t.ends_with(".py")).cloned().collect();
     if !py.is_empty() {
-        let override_python = config::get(env, "COLLIDE_PYTEST_PYTHON");
+        let override_python = config::get(env, "CORK_PYTEST_PYTHON");
         let python: String = if !override_python.is_empty() {
             override_python.to_string()
         } else {

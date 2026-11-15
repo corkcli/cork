@@ -449,75 +449,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
-name = "collide-core"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "sha1",
- "sha2 0.10.9",
- "tree-sitter",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-typescript",
-]
-
-[[package]]
-name = "collide-hooks"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "collide-core",
- "ed25519-dalek",
- "fancy-regex",
- "regex",
- "serde_json",
- "sha2 0.10.9",
- "ureq 2.12.1",
-]
-
-[[package]]
-name = "collide-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "chrono",
- "collide-core",
- "collide-hooks",
- "fastembed",
- "flate2",
- "hmac 0.12.1",
- "http",
- "jsonwebtoken",
- "libmimalloc-sys",
- "mimalloc",
- "postgres",
- "rayon",
- "regex",
- "reqwest",
- "rmcp",
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "sha2 0.10.9",
- "tokio",
- "tower-http 0.7.1",
- "tracing",
- "tracing-subscriber",
- "ureq 2.12.1",
- "url",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -622,6 +553,102 @@ name = "core_detect"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
+name = "cork-core"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "cork-hooks"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "cork-core",
+ "cork-protocol",
+ "cork-protocol-code",
+ "ed25519-dalek",
+ "fancy-regex",
+ "regex",
+ "serde_json",
+ "sha2 0.10.9",
+ "ureq 2.12.1",
+]
+
+[[package]]
+name = "cork-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tungstenite",
+]
+
+[[package]]
+name = "cork-protocol-code"
+version = "0.1.0"
+dependencies = [
+ "cork-protocol",
+ "serde_json",
+]
+
+[[package]]
+name = "cork-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "cork-core",
+ "cork-hooks",
+ "cork-protocol",
+ "cork-protocol-code",
+ "ed25519-dalek",
+ "fastembed",
+ "flate2",
+ "futures-util",
+ "hmac 0.12.1",
+ "http",
+ "jsonwebtoken",
+ "libmimalloc-sys",
+ "mimalloc",
+ "postgres",
+ "rayon",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "rsa",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "ureq 2.12.1",
+ "url",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -4404,9 +4431,12 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.8.8",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

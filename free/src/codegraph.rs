@@ -1,13 +1,13 @@
 //! The live code graph's storage side.
 //!
-//! `collide-core` resolves a file's edges; this keeps the per-file records and
+//! `cork-core` resolves a file's edges; this keeps the per-file records and
 //! the reverse index that answers "what depends on this symbol" without
 //! walking the whole graph. Both move on every clean report, which is what
 //! makes the graph current on the write rather than on a commit.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use collide_core::graph as core_graph;
+use cork_core::graph as core_graph;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -16,11 +16,12 @@ use crate::store::Store;
 pub const GRAPH_BUCKET: &str = "graph";
 pub const REV_BUCKET: &str = "graphrev";
 
-/// Collide's own installed files (`.collide/report_hook.py`, the gate, the
-/// config) are tracked by git in every repo setup touches. They are not the
-/// user's code: never in the map's hubs, recency or working sets.
+/// Cork's own installed files (`.cork/config.json`, and the older
+/// `.collide/report_hook.py`, the gate, the config) are tracked by git in
+/// every repo setup touches. They are not the user's code: never in the
+/// map's hubs, recency or working sets.
 pub fn is_collide_artifact(path: &str) -> bool {
-    path.starts_with(".collide/") || path.contains("/.collide/")
+    [".cork/", ".collide/"].iter().any(|dir| path.starts_with(dir) || path.contains(&format!("/{dir}")))
 }
 
 pub fn path_key(path: &str) -> String {
@@ -235,7 +236,7 @@ fn records_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String
 /// set: the files most recently written or read, up to this many. The rest
 /// are still in the name index (imports resolve against the whole repo) and
 /// in the reverse index on disk; they join the working set the moment an
-/// agent touches them. `COLLIDE_RESIDENT_FILES` tunes it.
+/// agent touches them. `CORK_RESIDENT_FILES` tunes it.
 pub fn resident_limit() -> usize {
     #[cfg(test)]
     if let Some(limit) = TEST_LIMIT.with(|l| l.get()) {
@@ -243,7 +244,7 @@ pub fn resident_limit() -> usize {
     }
     static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        std::env::var("COLLIDE_RESIDENT_FILES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8_000)
+        crate::env::var("CORK_RESIDENT_FILES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8_000)
     })
 }
 
@@ -387,7 +388,7 @@ fn contributions(record: &Value) -> Vec<String> {
 /// time. Every write used to re-read and re-parse every record in the repo
 /// to learn only these two things (about 120ms a write on a 3,000-file
 /// repo). `stat` is the graph rows' count and newest write when the index
-/// was last in step: a write from anywhere else (the other half, a deleted
+/// was last in step: a write from anywhere else (another process, a deleted
 /// repo) moves it, and the index is rebuilt once.
 struct GraphIndex {
     stat: (i64, f64),
@@ -696,6 +697,168 @@ pub fn observe_files(
     outcomes
 }
 
+/// How long a file the trunk does not track keeps its place in the map after
+/// it was last written or read: a teammate's new file, not committed yet, or
+/// a branch's that nobody on the trunk has.
+pub const ABSENT_GRACE_S: f64 = 3.0 * 86_400.0;
+/// A trunk checkout's list is trusted to take out at most this share of the
+/// map: one that says most of it is gone names another repo (a nested
+/// checkout, a wrong root), not this one.
+const ABSENT_MAX_SHARE: f64 = 0.5;
+
+/// Take files out of the map: their records, the callers their edges gave
+/// other files' symbols (the reverse index), their own symbols' rows there,
+/// and their search vectors. A record written or read at or after `before`
+/// stays: it is someone's live copy. The map only ever learned files, so a
+/// file deleted or moved stayed in it for good, and every name it defined
+/// had two homes (`server/collide-hooks/src/wake.rs` beside
+/// `server/cork-hooks/src/wake.rs`), which the map could not tell apart.
+/// Returns the paths taken out.
+pub fn forget_files(store: &Store, scope: &str, paths: &[String], before: f64) -> Vec<String> {
+    let mut gone: Vec<String> = Vec::new();
+    for path in paths {
+        let key = format!("{scope}:{}", path_key(path));
+        let Some(record) = store.kv_get(GRAPH_BUCKET, &key) else { continue };
+        if record.get("ts").and_then(Value::as_f64).unwrap_or(0.0) >= before {
+            continue;
+        }
+        let own = |node: &str| node == path || node.strip_prefix(path.as_str()).is_some_and(|rest| rest.starts_with("::"));
+        // the callers this file gave the symbols it called
+        let mut touched: BTreeMap<String, Value> = BTreeMap::new();
+        for edge in record.get("edges").and_then(Value::as_array).into_iter().flatten() {
+            let (Some(from), Some(to)) = (edge.get("from").and_then(Value::as_str), edge.get("to").and_then(Value::as_str)) else {
+                continue;
+            };
+            if to.starts_with("ext:") || own(to) {
+                continue;
+            }
+            let Some(entry) = touched
+                .entry(to.to_string())
+                .or_insert_with(|| store.kv_get(REV_BUCKET, &format!("{scope}:{to}")).unwrap_or(Value::Null))
+                .get_mut("dependents")
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            entry.remove(from);
+        }
+        let writes: Vec<(String, String, Value)> = touched
+            .into_iter()
+            .filter(|(_, entry)| !entry.is_null())
+            .map(|(target, entry)| (REV_BUCKET.to_string(), format!("{scope}:{target}"), entry))
+            .collect();
+        if !writes.is_empty() {
+            let _ = store.kv_put_many(writes, crate::store::now());
+        }
+        // its own symbols' callers: nothing is left to call
+        let _ = store.kv_delete(REV_BUCKET, &format!("{scope}:{path}"));
+        for (rev_key, _) in store.kv_list(REV_BUCKET, &format!("{scope}:{path}::")) {
+            let _ = store.kv_delete(REV_BUCKET, &rev_key);
+        }
+        let _ = store.kv_delete(crate::embed::BUCKET, &key);
+        if store.kv_delete(GRAPH_BUCKET, &key).is_ok() {
+            gone.push(path.clone());
+        }
+    }
+    if !gone.is_empty() {
+        // the file set, the name index and the assembled graph move with it
+        crate::graphview::invalidate(store, scope);
+    }
+    gone
+}
+
+/// Each file's path and when it was last written or read, as the map holds them.
+fn paths_and_times(store: &Store, scope: &str) -> Vec<(String, f64)> {
+    let mut out: Vec<(String, f64)> = Vec::new();
+    store.kv_for_each(GRAPH_BUCKET, &format!("{scope}:"), |_key, row| {
+        if let Some(path) = path_of(&row) {
+            out.push((path, row.get("ts").and_then(Value::as_f64).unwrap_or(0.0)));
+        }
+    });
+    out
+}
+
+/// The old copies of files git moved: a record at a moved path, written
+/// before the move, is the file that now lives at the new path (the
+/// session-start index brings it in there). The same rule every ledger row
+/// is read by (moves.rs): one written at the old path after the move is a
+/// new file, and stays. Returns the paths taken out.
+pub fn forget_moved(store: &Store, scope: &str) -> Vec<String> {
+    let Some(moves) = store.kv_get(crate::moves::MOVES_BUCKET, scope).as_ref().and_then(crate::moves::Moves::from_record) else {
+        return Vec::new();
+    };
+    let moved: Vec<String> = paths_and_times(store, scope)
+        .into_iter()
+        .filter(|(path, ts)| moves.translate_str(path, *ts).is_some())
+        .map(|(path, _)| path)
+        .collect();
+    // a copy written since the listing is newer than every move
+    forget_files(store, scope, &moved, moves.latest)
+}
+
+/// What a checkout on the trunk tracks (`present`, every source path git
+/// lists there, its HEAD made at `head_ts`): a file the map holds that is not
+/// among them was deleted on the trunk, or only ever lived in someone's
+/// checkout (a scratch page, a worktree's path read from the wrong root). It
+/// leaves once it was last written or read before both that commit and
+/// [`ABSENT_GRACE_S`]. Refused, taking nothing, when the list would empty
+/// most of the map.
+pub fn forget_absent(store: &Store, scope: &str, present: &BTreeSet<String>, head_ts: f64, now: f64) -> Value {
+    if present.is_empty() {
+        return json!({"ok": false, "error": "no paths"});
+    }
+    let before = head_ts.min(now - ABSENT_GRACE_S);
+    let held = paths_and_times(store, scope);
+    let absent: Vec<String> =
+        held.iter().filter(|(path, ts)| *ts < before && !present.contains(path)).map(|(path, _)| path.clone()).collect();
+    if absent.len() as f64 > held.len() as f64 * ABSENT_MAX_SHARE {
+        return json!({"ok": false, "refused": true, "absent": absent.len(), "files": held.len(),
+                      "error": "this list leaves out most of the map: kept as it is"});
+    }
+    let gone = forget_files(store, scope, &absent, before);
+    json!({"ok": true, "dropped": gone.len(), "files": held.len()})
+}
+
+const SWEEP_BUCKET: &str = "map_sweeps";
+const MOVED_SWEEP: &str = "moved_v1";
+
+/// Once per database: every repo's map lets go of the old copies of the
+/// files git moved before the map learned to ([`forget_moved`]). Cork's own
+/// repo held its pre-rename crates (`server/collide-rs/`,
+/// `server/collide-hooks/`, `collide-python/`) beside the renamed ones,
+/// and briefings named files that no longer existed. Returns (repos, files)
+/// taken out, `None` when it ran before.
+pub fn sweep_moved(store: &Store, now: f64) -> Option<(usize, usize)> {
+    if store.kv_get(SWEEP_BUCKET, MOVED_SWEEP).is_some() {
+        return None;
+    }
+    let (mut scopes, mut files) = (0usize, 0usize);
+    for (scope, _) in store.kv_list(crate::moves::MOVES_BUCKET, "") {
+        let gone = forget_moved(store, &scope);
+        if !gone.is_empty() {
+            tracing::info!(scope = %scope, files = gone.len(), "map sweep: moved files' old copies left the map");
+            scopes += 1;
+            files += gone.len();
+        }
+    }
+    let _ = store.kv_put(SWEEP_BUCKET, MOVED_SWEEP, &json!({"ts": now, "scopes": scopes, "files": files}), now);
+    Some((scopes, files))
+}
+
+/// At boot, detached: the moved-files sweep, once the store has caught up
+/// with the durable log.
+pub fn start_moved_sweep(store: std::sync::Arc<Store>) {
+    let _ = std::thread::Builder::new().name("cork-map-sweep".into()).spawn(move || {
+        let waited = std::time::Instant::now();
+        while store.engine().is_some_and(|e| !e.ready()) && waited.elapsed() < std::time::Duration::from_secs(3600) {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+        if let Some((scopes, files)) = sweep_moved(&store, crate::store::now()) {
+            tracing::info!(scopes, files, "map sweep: done");
+        }
+    });
+}
+
 /// Resolve one file's edges against a known file set and name index, store
 /// it, and move the reverse index.
 #[allow(clippy::too_many_arguments)]
@@ -852,7 +1015,7 @@ mod index_tests {
         // an idle repo leaves memory, and comes back whole on next use
         assert!(evict_idle(-1.0) >= 1);
         assert!(with_known(&db, scope, |known| known.contains("pkg/a.py") && known.contains("pkg/d.py")));
-        // a write from elsewhere (another half) moves the rows: rebuilt, not stale
+        // a write from elsewhere (another process) moves the rows: rebuilt, not stale
         let _ = db.kv_put(GRAPH_BUCKET, &format!("{scope}:{}", path_key("pkg/e.py")), &rec("pkg/e.py", &["zed"]), 2_000.0);
         assert!(with_known(&db, scope, |known| known.contains("pkg/e.py")));
     }
@@ -896,5 +1059,136 @@ mod index_tests {
         let graph = crate::graphview::snapshot(&db, scope);
         assert!(graph.nodes.contains_key("lib/core.py::helper"));
         set_test_resident_limit(None);
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::*;
+
+    fn rec(path: &str, names: &[&str], ts: f64) -> Value {
+        let symbols: serde_json::Map<String, Value> =
+            names.iter().map(|n| (n.to_string(), json!({"kind": "function", "signature": format!("def {n}()")}))).collect();
+        json!({"path": path, "language": "python", "symbols": symbols, "imports": [], "ts": ts})
+    }
+
+    fn calls(path: &str, name: &str, module: &str, callee: &str, ts: f64) -> Value {
+        json!({"path": path, "language": "python", "ts": ts,
+               "symbols": {name: {"kind": "function", "edges": [[callee, "", "calls"]]}},
+               "imports": [{"module": module, "names": [[callee, callee]]}]})
+    }
+
+    fn put(db: &Store, scope: &str, record: Value) {
+        let path = record["path"].as_str().unwrap().to_string();
+        let ts = record["ts"].as_f64().unwrap();
+        update_file(db, scope, &path, record, ts);
+    }
+
+    fn paths(db: &Store, scope: &str) -> Vec<String> {
+        let mut out: Vec<String> = paths_and_times(db, scope).into_iter().map(|(p, _)| p).collect();
+        out.sort();
+        out
+    }
+
+    fn moved(db: &Store, scope: &str, from: &str, to: &str, at: f64) {
+        crate::moves::record_moves(db, scope, "kevin", &[json!({"from": from, "to": to, "files": 2, "commit": "ab12", "at": at})]);
+    }
+
+    /// The field report: after `server/collide-hooks/` became
+    /// `server/cork-hooks/`, the grep companion said "`credentials` is
+    /// defined in more than one file", named both, answered nothing, and
+    /// recorded no saving.
+    #[test]
+    fn a_moved_files_old_copy_leaves_and_its_names_have_one_home_again() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let scope = "w:r";
+        put(&db, scope, rec("hooks_old/wake.py", &["credentials", "wake"], 1_000.0));
+        put(&db, scope, rec("hooks_old/ide.py", &["workspace"], 1_000.0));
+        put(&db, scope, rec("hooks/wake.py", &["credentials", "wake"], 3_000.0));
+        put(&db, scope, rec("hooks/ide.py", &["workspace"], 3_000.0));
+        // written at the old path after the move: a new file there, not a copy
+        put(&db, scope, rec("hooks_old/new.py", &["fresh"], 2_500.0));
+        let ask = |name: &str| crate::check::attribute(&db, scope, "kevin", "s1", &[], &[name.to_string()], 4_000.0)["facts"][name].clone();
+        assert!(ask("credentials").get("ambiguous").is_some(), "both copies, told apart by nothing");
+
+        moved(&db, scope, "hooks_old/", "hooks/", 2_000.0);
+        let mut gone = forget_moved(&db, scope);
+        gone.sort();
+        assert_eq!(gone, vec!["hooks_old/ide.py", "hooks_old/wake.py"]);
+        assert_eq!(paths(&db, scope), vec!["hooks/ide.py", "hooks/wake.py", "hooks_old/new.py"]);
+        assert_eq!(ask("credentials")["path"], json!("hooks/wake.py"), "{}", ask("credentials"));
+        assert!(ask("credentials").get("elsewhere").is_none());
+        // the name index and file set are what a rebuild makes
+        let handle = index_for(&db, scope);
+        let live = handle.lock().unwrap();
+        let fresh = GraphIndex::build(&db, scope);
+        assert_eq!((live.known.clone(), live.names.clone()), (fresh.known.clone(), fresh.names.clone()));
+        assert!(!live.known.contains("hooks_old/wake.py"));
+        drop(live);
+        assert!(forget_moved(&db, scope).is_empty(), "nothing left to take");
+    }
+
+    #[test]
+    fn a_forgotten_file_leaves_the_reverse_index_and_its_search_vector() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let scope = "w:r";
+        put(&db, scope, rec("lib/core.py", &["compute"], 1_000.0));
+        put(&db, scope, calls("app/main.py", "run", "lib.core", "compute", 1_001.0));
+        let rev = |target: &str| db.kv_get(REV_BUCKET, &format!("{scope}:{target}"));
+        assert!(rev("lib/core.py::compute").unwrap()["dependents"].get("app/main.py::run").is_some(), "{:?}", rev("lib/core.py::compute"));
+        let _ = db.kv_put(crate::embed::BUCKET, &format!("{scope}:{}", path_key("app/main.py")), &json!({"v": 1}), 1.0);
+
+        // a record written since `before` is someone's live copy
+        assert!(forget_files(&db, scope, &["app/main.py".to_string()], 1_000.0).is_empty());
+        assert_eq!(forget_files(&db, scope, &["app/main.py".to_string()], f64::INFINITY), vec!["app/main.py"]);
+        let dependents = rev("lib/core.py::compute").unwrap()["dependents"].clone();
+        assert!(dependents.get("app/main.py::run").is_none(), "{dependents}");
+        assert!(db.kv_get(crate::embed::BUCKET, &format!("{scope}:{}", path_key("app/main.py"))).is_none());
+        // and the callee's own row goes with the callee
+        assert_eq!(forget_files(&db, scope, &["lib/core.py".to_string()], f64::INFINITY), vec!["lib/core.py"]);
+        assert!(rev("lib/core.py::compute").is_none());
+        assert!(paths(&db, scope).is_empty());
+    }
+
+    #[test]
+    fn the_trunks_list_takes_out_what_it_no_longer_has_once_nobody_touched_it() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let scope = "w:r";
+        let now = 10_000_000.0;
+        let head = now - 6.0 * 86_400.0;
+        put(&db, scope, rec("kept.py", &["a"], now - 30.0 * 86_400.0));
+        put(&db, scope, rec("deleted.py", &["b"], now - 30.0 * 86_400.0));
+        put(&db, scope, rec("scratch/zz-preview.py", &["c"], now - 20.0 * 86_400.0));
+        // a teammate's new file, not committed: written an hour ago
+        put(&db, scope, rec("new_here.py", &["d"], now - 3_600.0));
+        // a branch's file, written after the trunk's HEAD was made
+        put(&db, scope, rec("on_a_branch.py", &["e"], head + 86_400.0));
+        put(&db, scope, rec("more.py", &["f"], now - 30.0 * 86_400.0));
+        let present: BTreeSet<String> = ["kept.py", "more.py"].iter().map(|s| s.to_string()).collect();
+
+        let answer = forget_absent(&db, scope, &present, head, now);
+        assert_eq!(answer["dropped"], json!(2), "{answer}");
+        assert_eq!(paths(&db, scope), vec!["kept.py", "more.py", "new_here.py", "on_a_branch.py"]);
+
+        // a list that leaves out most of the map names another repo
+        let other: BTreeSet<String> = ["elsewhere.py"].iter().map(|s| s.to_string()).collect();
+        let refused = forget_absent(&db, scope, &other, now, now + 10.0 * 86_400.0);
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(paths(&db, scope).len(), 4, "nothing taken");
+        assert_eq!(forget_absent(&db, scope, &BTreeSet::new(), now, now)["ok"], json!(false));
+    }
+
+    #[test]
+    fn the_moved_sweep_runs_once_per_database_over_every_repo_with_moves() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        for scope in ["w:a", "w:b"] {
+            put(&db, scope, rec("old/x.py", &["x"], 1_000.0));
+            put(&db, scope, rec("new/x.py", &["x"], 3_000.0));
+        }
+        moved(&db, "w:a", "old/", "new/", 2_000.0);
+        assert_eq!(sweep_moved(&db, 5_000.0), Some((1, 1)));
+        assert_eq!(paths(&db, "w:a"), vec!["new/x.py"]);
+        assert_eq!(paths(&db, "w:b"), vec!["new/x.py", "old/x.py"], "no move there");
+        assert_eq!(sweep_moved(&db, 6_000.0), None, "once");
     }
 }

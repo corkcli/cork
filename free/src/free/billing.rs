@@ -1,4 +1,4 @@
-//! The free version has no billing; the cloud's lives in Collide's private
+//! The free version has no billing; the cloud's lives in Cork's private
 //! repo. These are its free answers, under the same names, so the engine
 //! builds and runs on one machine without it.
 
@@ -27,8 +27,8 @@ pub struct PlanDef {
 }
 
 pub const PLANS: &[PlanDef] = &[
-    PlanDef { name: "free", label: "Collide Free", limits: &[] },
-    PlanDef { name: "business", label: "Collide Free", limits: &[] },
+    PlanDef { name: "free", label: "Cork", limits: &[] },
+    PlanDef { name: "business", label: "Cork", limits: &[] },
 ];
 
 pub fn count_call(_store: &Store, _workspace_id: &str) {}
@@ -47,10 +47,15 @@ pub fn is_active_status(status: Option<&Value>) -> bool {
 }
 
 pub fn bound_repos(store: &Store, workspace_id: &str) -> BTreeSet<String> {
-    let prefix = format!("{workspace_id}:");
-    let mut keys: BTreeSet<String> = store.list_scopes(&prefix).iter().map(|s| crate::repo::repo_key(&s[prefix.len()..])).collect();
+    let mut keys: BTreeSet<String> = bound_repo_ids(store, workspace_id).iter().map(|id| crate::repo::repo_key(id)).collect();
     keys.remove("");
-    keys
+    crate::repo::dedupe_spellings(keys)
+}
+
+/// [`bound_repos`] as the ids were spelled: on one machine, the repos with data.
+pub fn bound_repo_ids(store: &Store, workspace_id: &str) -> Vec<String> {
+    let prefix = format!("{workspace_id}:");
+    store.list_scopes(&prefix).iter().map(|s| s[prefix.len()..].to_string()).filter(|id| !id.is_empty()).collect()
 }
 
 pub fn repo_cap_error(_store: &Store, _workspace_id: &str, _repo_id: &str) -> Option<Value> {
@@ -75,4 +80,43 @@ pub fn workspace_limit_for(_store: &Store, _owned: &[Value]) -> Option<i64> {
 
 pub fn router() -> axum::Router<Arc<crate::App>> {
     axum::Router::new()
+}
+
+// agent hours (the cloud's meter): on one machine nothing is metered
+
+pub const UNIT_CENTS: i64 = 2000;
+
+pub fn hours_per_unit() -> i64 {
+    100
+}
+
+pub fn session_gate(_store: &Store, _workspace_id: &str, _uid: &str, _session: &str, _dashboard_url: &str) -> Option<String> {
+    None
+}
+
+pub fn meter_active(_store: &Store, _workspace_id: &str, _uid: &str, _secs: f64, _dashboard_url: &str) {}
+
+pub fn hours_notice(_store: &Store, _workspace_id: &str, _uid: &str, _dashboard_url: &str) -> Option<String> {
+    None
+}
+
+pub fn hours_state(_store: &Store, _workspace_id: &str, _owner_uid: &str) -> Option<(i64, f64, i64, &'static str, String, f64)> {
+    None
+}
+
+pub fn move_units_pool(_store: &Store, _from_ws: &str, _to_ws: &str) -> bool {
+    false
+}
+
+pub const SIGNUP_BONUS_HOURS: i64 = 30;
+pub const INVITE_BONUS_HOURS: i64 = 10;
+
+pub fn grant_bonus(_store: &Store, _workspace_id: &str, _uid: &str, _kind: &str, _hours: i64) -> bool {
+    false
+}
+
+pub fn meter_mcp_call(_store: &Store, _workspace_id: &str, _uid: &str, _session: &str, _dashboard_url: &str) {}
+
+pub fn seat_plan_sunset(_store: &Store, _workspace_id: &str) -> Option<Value> {
+    None
 }

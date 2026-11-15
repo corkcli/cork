@@ -1,9 +1,7 @@
-//! The three storage tiers over the same SQLite file the Python server uses.
+//! The three storage tiers (ephemeral, shared, ledger) over one SQLite file.
 //!
-//! Schema, key shapes and JSON encodings are deliberately identical: the two
-//! servers can run against one database during the migration, and a row
-//! written by either is readable by the other. That is what makes moving an
-//! endpoint at a time safe.
+//! Schema, key shapes and JSON encodings are part of the stored data: rows
+//! already written must stay readable, and ledger rows stay verifiable.
 //!
 //! Concurrency: one WRITER connection behind a lock (which is what makes the
 //! ledger's read-head-then-insert race-free) and a pool of READER
@@ -20,8 +18,8 @@
 //!   lookup is a map read;
 //! - prefix scans and stats (`kv_list`, `kv_stat`, `list_scopes`), cached
 //!   against a version that every write under that prefix moves.
-//! The parity tests run the Python server on the same file, so a second
-//! writer can exist there: `COLLIDE_DB_SHARED=1` turns every cache off.
+//! `CORK_DB_SHARED=1` says another process writes the same file (the
+//! pytest harness seeds the database directly) and turns every cache off.
 
 use std::path::Path;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -43,11 +41,9 @@ tokio::task_local! {
 tokio::task_local! {
     /// Which address the current request came in on — "host path" — set
     /// around every hot-route handler (the `via_scope` middleware) and every
-    /// MCP tool dispatch, the way Python's `_VIA` contextvar is set at the
-    /// top of every hook request and tool call. `ledger_append` stamps it
-    /// onto every row as `via`, so both halves' rows answer "who is still on
-    /// api.collidemcp.com/mcp vs the mcp. root". Dashboard routes set none,
-    /// and Python's `record()` stamps none there either.
+    /// MCP tool dispatch. `ledger_append` stamps it onto every row as
+    /// `via`, so the rows answer "who is still on api.corkcli.com/mcp vs
+    /// the mcp. root". Dashboard routes set none.
     pub static VIA: String;
 }
 
@@ -57,9 +53,8 @@ pub fn current_via() -> String {
     VIA.try_with(|via| via.clone()).unwrap_or_default()
 }
 
-/// Python's `record()`: `{**payload, "via": tag}` when a tag is known and
-/// the row does not carry one already — appended last, as Python's dict
-/// merge leaves it.
+/// `{...payload, "via": tag}` when a tag is known and the row does not
+/// carry one already — appended last.
 fn stamp_via(payload: &Value) -> Value {
     let via = current_via();
     if via.is_empty() {
@@ -134,9 +129,7 @@ CREATE TABLE IF NOT EXISTS engine_outbox (
 /// the data, none of the engine's own bookkeeping.
 pub const LOGGED_TABLES: [&str; 5] = ["ephem", "shared_files", "shared_trees", "app_kv", "ledger"];
 
-// Phase 1 uses part of this surface; the rest is what the endpoints
-// still to move across will call. Kept whole so the tier is reviewable
-// against the Python driver side by side rather than in fragments.
+// Not every method has a caller yet; kept whole rather than in fragments.
 #[allow(dead_code)]
 pub struct Store {
     /// Live subscribers per scope: the dashboard's WebSocket feed. This is
@@ -184,7 +177,18 @@ pub struct Store {
     /// never answer for another database (tests open many at once). It moves
     /// when the rows are replaced underneath (a standby applying the log).
     id: std::sync::atomic::AtomicU64,
+    /// Each scope's path moves as reads translate by them (moves.rs), and
+    /// the epoch they were read under: any write to the moves bucket moves
+    /// the epoch. Most scopes have none, held as `None`: one map read.
+    moves: RwLock<HashMap<String, (u64, f64, Option<Arc<crate::moves::Moves>>)>>,
+    moves_epoch: AtomicU64,
 }
+
+/// How long a scope's moves are trusted when another process may write
+/// them (no in-memory tiers, so no write here moves the epoch).
+const MOVES_SHARED_TTL_S: f64 = 5.0;
+/// Past this many scopes the moves cache starts over.
+const MOVES_CACHE_SCOPES: usize = 20_000;
 
 /// Where chain verification left off: the last sound row, when the whole
 /// chain was last walked, and what that walk concluded.
@@ -447,15 +451,15 @@ impl Mem {
 }
 
 /// How long a verified prefix is trusted before the whole chain is walked
-/// again. Python's `FULL_WALK_EVERY_S`.
+/// again.
 pub const FULL_WALK_EVERY_S: f64 = 3600.0;
 
 #[allow(dead_code)]
 impl Store {
     /// Open (creating) the database. The in-memory tiers are on unless
-    /// `COLLIDE_DB_SHARED=1` says another process writes the same file.
+    /// `CORK_DB_SHARED=1` says another process writes the same file.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        let shared = std::env::var("COLLIDE_DB_SHARED").map(|v| v.trim() == "1").unwrap_or(false);
+        let shared = crate::env::var("CORK_DB_SHARED").map(|v| v.trim() == "1").unwrap_or(false);
         Self::open_with(path, !shared)
     }
 
@@ -468,13 +472,13 @@ impl Store {
         // WAL with NORMAL sync: a commit is durable against a process crash
         // and fsyncs at checkpoints rather than on every write — the setting
         // SQLite recommends for WAL. The wait covers a checkpoint colliding
-        // with the Python half in the parity tests.
+        // with another process on the same file (CORK_DB_SHARED).
         conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA cache_size=-65536; PRAGMA mmap_size=1073741824;")?;
         let in_memory = path.as_os_str() == ":memory:" || path.as_os_str().is_empty();
         let count = if in_memory {
             0
         } else {
-            std::env::var("COLLIDE_DB_READERS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| {
+            crate::env::var("CORK_DB_READERS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| {
                 std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16)
             })
         };
@@ -524,6 +528,8 @@ impl Store {
             bus: std::sync::Mutex::new(std::collections::HashMap::new()),
             chain_check: Mutex::new(None),
             id: std::sync::atomic::AtomicU64::new(NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            moves: RwLock::new(HashMap::new()),
+            moves_epoch: AtomicU64::new(0),
         })
     }
 
@@ -817,6 +823,7 @@ impl Store {
             mem.trees_dirty.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         self.id.store(NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        self.moves_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// A batch that did not commit leaves memory ahead of disk: the chain
@@ -856,6 +863,8 @@ impl Store {
             let mut last_eph_write = now();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(EPH_FLUSH_MS));
+                // the status page watches that this loop goes round
+                crate::status::note_loop("flush");
                 if !store.writable() {
                     continue;
                 }
@@ -990,7 +999,7 @@ impl Store {
             let _ = c.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get::<_, i64>(0));
         }
         let size = std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0);
-        let limit = std::env::var("COLLIDE_WAL_LIMIT_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb * 1024 * 1024).unwrap_or(WAL_LIMIT_BYTES);
+        let limit = crate::env::var("CORK_WAL_LIMIT_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb * 1024 * 1024).unwrap_or(WAL_LIMIT_BYTES);
         if size < limit {
             return false;
         }
@@ -1072,8 +1081,8 @@ impl Store {
         let _ = self.write("eph_delete", move |_, conn| conn.execute("DELETE FROM ephem WHERE key = ?", params![key]));
     }
 
-    /// Prefix scan over the ephemeral table. GLOB with `[` escaped, byte for
-    /// byte the Python driver's pattern, so a `_` or `%` in a scope (a repo
+    /// Prefix scan over the ephemeral table. GLOB with `[` escaped
+    /// (`glob_prefix`), so a `_` or `%` in a scope (a repo
     /// id like `acme/api_v2`) is matched literally and never widens the read
     /// onto a sibling scope.
     pub fn eph_scan(&self, prefix: &str) -> Vec<(String, Value)> {
@@ -1118,6 +1127,28 @@ impl Store {
             .collect()
     }
 
+    /// A new value for an ephemeral record that keeps the record's expiry,
+    /// so a rewrite never lengthens a marker's life. False when the key is
+    /// gone (or expired).
+    pub fn eph_replace(&self, key: &str, value: &Value) -> bool {
+        if let Some(mem) = &self.mem {
+            let found = mem.eph[shard_of(key)].read().unwrap_or_else(|e| e.into_inner()).get(key).map(|(_, expires)| *expires);
+            let Some(expires) = found else { return false };
+            if expires.is_some_and(|at| at <= now()) {
+                return false;
+            }
+            mem.eph_put(key, value.clone(), expires);
+            return true;
+        }
+        let conn = self.writer();
+        conn.execute(
+            "UPDATE ephem SET value = ? WHERE key = ? AND (expires IS NULL OR expires > ?)",
+            params![value.to_string(), key, now()],
+        )
+        .map(|changed| changed > 0)
+        .unwrap_or(false)
+    }
+
     // ------------------------------------------------------------- shared kv
 
     pub fn kv_get(&self, bucket: &str, key: &str) -> Option<Value> {
@@ -1125,7 +1156,10 @@ impl Store {
             Some(mem) => {
                 let cached = mem.kv[shard_of(key)].read().unwrap_or_else(|e| e.into_inner())
                     .get(&(bucket.to_string(), key.to_string())).cloned();
-                if let Some(value) = cached {
+                if let Some(mut value) = cached {
+                    if let Some(value) = value.as_mut() {
+                        self.moved_note(bucket, key, value);
+                    }
                     return value;
                 }
                 Some(mem.version_for(bucket, key))
@@ -1150,6 +1184,10 @@ impl Store {
                 mem.kv_remember(bucket, key, value.clone(), seen, bytes);
             }
         }
+        let mut value = value;
+        if let Some(value) = value.as_mut() {
+            self.moved_note(bucket, key, value);
+        }
         value
     }
 
@@ -1158,9 +1196,80 @@ impl Store {
         if let Some(mem) = &self.mem {
             mem.touched(bucket, key);
         }
+        if bucket == crate::moves::MOVES_BUCKET {
+            self.moves_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // ------------------------------------------------------- path moves
+
+    /// A scope's applied path moves (moves.rs), `None` for the many scopes
+    /// with none. The epoch is read before the row, so a write that lands
+    /// in between leaves this entry behind it and the next read refreshes.
+    pub fn path_moves(&self, scope: &str) -> Option<Arc<crate::moves::Moves>> {
+        let epoch = self.moves_epoch.load(Ordering::SeqCst);
+        let stamp = now();
+        if let Some((seen, at, moves)) = self.moves.read().unwrap_or_else(|e| e.into_inner()).get(scope) {
+            if *seen == epoch && (self.mem.is_some() || stamp - at < MOVES_SHARED_TTL_S) {
+                return moves.clone();
+            }
+        }
+        let moves = self.kv_get(crate::moves::MOVES_BUCKET, scope).as_ref().and_then(crate::moves::Moves::from_record).map(Arc::new);
+        let mut cache = self.moves.write().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= MOVES_CACHE_SCOPES {
+            cache.clear();
+        }
+        cache.insert(scope.to_string(), (epoch, stamp, moves.clone()));
+        moves
+    }
+
+    /// Rows read back as they read after the scope's moves: a row written
+    /// before a move names the new path (moves.rs).
+    fn moved_rows(&self, scope: &str, mut rows: Vec<LedgerRow>) -> Vec<LedgerRow> {
+        if rows.is_empty() {
+            return rows;
+        }
+        if let Some(moves) = self.path_moves(scope) {
+            for row in rows.iter_mut().filter(|row| row.ts < moves.latest) {
+                moves.translate(&mut row.payload, row.ts);
+            }
+        }
+        rows
+    }
+
+    /// A note or decision (the `memory` bucket, keyed `{scope}:{id}`) as it
+    /// reads after its scope's moves: its anchors follow the paths.
+    fn moved_note(&self, bucket: &str, key: &str, value: &mut Value) {
+        if bucket != "memory" {
+            return;
+        }
+        let Some((scope, _)) = key.rsplit_once(':') else { return };
+        if let Some(moves) = self.path_moves(scope) {
+            moves.translate_note(value);
+        }
+    }
+
+    /// `moved_note` over a list, looking each scope's moves up once.
+    fn moved_notes(&self, bucket: &str, rows: &mut [(String, Value)]) {
+        if bucket != "memory" || rows.is_empty() {
+            return;
+        }
+        let mut last: Option<(String, Option<Arc<crate::moves::Moves>>)> = None;
+        for (key, value) in rows.iter_mut() {
+            let Some((scope, _)) = key.rsplit_once(':') else { continue };
+            if last.as_ref().map(|(s, _)| s.as_str()) != Some(scope) {
+                last = Some((scope.to_string(), self.path_moves(scope)));
+            }
+            if let Some((_, Some(moves))) = &last {
+                moves.translate_note(value);
+            }
+        }
     }
 
     pub fn kv_put(&self, bucket: &str, key: &str, value: &Value, now_ts: f64) -> rusqlite::Result<()> {
+        // a note read through a move is written back as it was anchored
+        let restored = if bucket == "memory" { crate::moves::restore_note(value) } else { None };
+        let value = restored.as_ref().unwrap_or(value);
         let result = self.kv_put_disk(bucket, key, value, now_ts);
         self.kv_touched(bucket, key);
         result
@@ -1190,7 +1299,13 @@ impl Store {
     /// graph record and every reverse-index row it moves.
     pub fn kv_put_many(&self, rows: Vec<(String, String, Value)>, now_ts: f64) -> rusqlite::Result<()> {
         let keys: Vec<(String, String)> = rows.iter().map(|(b, k, _)| (b.clone(), k.clone())).collect();
-        let owned: Vec<(String, String, String)> = rows.into_iter().map(|(b, k, v)| (b, k, v.to_string())).collect();
+        let owned: Vec<(String, String, String)> = rows
+            .into_iter()
+            .map(|(b, k, v)| {
+                let v = if b == "memory" { crate::moves::restore_note(&v).unwrap_or(v) } else { v };
+                (b, k, v.to_string())
+            })
+            .collect();
         for (b, _, v) in &owned {
             self.count_bytes(b, v.len());
         }
@@ -1210,12 +1325,11 @@ impl Store {
         result
     }
 
-    /// Idempotent: deleting an absent key is not an error, matching the
-    /// Python driver's plain `DELETE ... WHERE` with no row-count check.
+    /// Idempotent: deleting an absent key is not an error.
     /// The next number of a counter, atomically: one statement reads,
     /// raises to at least `floor`, increments and returns — two agents
     /// asking at once get two different numbers and no gap. The counter
-    /// lives in app_kv as `{"n": <last issued>}`. Python's `kv_next`.
+    /// lives in app_kv as `{"n": <last issued>}`.
     pub fn kv_next(&self, bucket: &str, key: &str, floor: i64, now_ts: f64) -> rusqlite::Result<i64> {
         let result = self.kv_next_disk(bucket, key, floor, now_ts);
         self.kv_touched(bucket, key);
@@ -1238,6 +1352,8 @@ impl Store {
     /// Insert only when the key is new; `true` when this call wrote it. Two
     /// agents racing for the same claim get one winner.
     pub fn kv_put_if_absent(&self, bucket: &str, key: &str, value: &Value, now_ts: f64) -> rusqlite::Result<bool> {
+        let restored = if bucket == "memory" { crate::moves::restore_note(value) } else { None };
+        let value = restored.as_ref().unwrap_or(value);
         let result = self.kv_put_if_absent_disk(bucket, key, value, now_ts);
         self.kv_touched(bucket, key);
         result
@@ -1333,10 +1449,16 @@ impl Store {
         })
     }
 
-    /// Prefix scan over one kv bucket. GLOB with `[` escaped like the Python
-    /// driver (see `eph_scan`), so per-scope reads that embed a repo id stay
+    /// Prefix scan over one kv bucket. GLOB with `[` escaped (see
+    /// `eph_scan`), so per-scope reads that embed a repo id stay
     /// on that scope.
     pub fn kv_list(&self, bucket: &str, prefix: &str) -> Vec<(String, Value)> {
+        let mut rows = self.kv_list_cached(bucket, prefix);
+        self.moved_notes(bucket, &mut rows);
+        rows
+    }
+
+    fn kv_list_cached(&self, bucket: &str, prefix: &str) -> Vec<(String, Value)> {
         let Some(mem) = &self.mem else { return self.kv_list_disk(bucket, prefix) };
         let id = (bucket.to_string(), prefix.to_string());
         let seen = mem.version_for(bucket, prefix);
@@ -1363,6 +1485,16 @@ impl Store {
     /// Every row under a prefix, handed to `f` one at a time as it is read:
     /// a whole bucket of a big repo is never held at once.
     pub fn kv_for_each(&self, bucket: &str, prefix: &str, mut f: impl FnMut(String, Value)) {
+        // notes are translated by their scope's moves, which are read
+        // through a connection of their own: read the (small) rows first
+        if bucket == "memory" {
+            let mut rows = self.kv_list_disk(bucket, prefix);
+            self.moved_notes(bucket, &mut rows);
+            for (key, value) in rows {
+                f(key, value);
+            }
+            return;
+        }
         let conn = self.reader();
         let Ok(mut statement) = conn.prepare(
             "SELECT key, value FROM app_kv WHERE bucket = ? AND key GLOB ?2 ORDER BY key",
@@ -1378,8 +1510,49 @@ impl Store {
         }
     }
 
+    /// Every kv row whose key holds `needle` anywhere, as (bucket, key): the
+    /// sweep behind an admin's workspace deletion, which must find a
+    /// workspace's rows in whatever bucket a module keyed them. `instr`, not
+    /// LIKE or GLOB, so nothing in the needle is a wildcard.
+    pub fn kv_keys_containing(&self, needle: &str) -> Vec<(String, String)> {
+        let conn = self.reader();
+        let Ok(mut statement) =
+            conn.prepare("SELECT bucket, key FROM app_kv WHERE instr(key, ?1) > 0 ORDER BY bucket, key")
+        else {
+            return Vec::new();
+        };
+        let rows = statement.query_map(params![needle], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)));
+        rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    /// Every kv row whose value holds `needle` and whose key does not: the
+    /// records that point at a workspace from outside its own keys.
+    pub fn kv_values_containing(&self, needle: &str) -> Vec<(String, String, Value)> {
+        let conn = self.reader();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT bucket, key, value FROM app_kv WHERE instr(key, ?1) = 0 AND instr(value, ?1) > 0 ORDER BY bucket, key",
+        ) else {
+            return Vec::new();
+        };
+        let rows = statement.query_map(params![needle], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        });
+        rows.map(|rows| {
+            rows.flatten()
+                .filter_map(|(bucket, key, raw)| serde_json::from_str(&raw).ok().map(|value| (bucket, key, value)))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     /// The `limit` rows under a prefix written most recently, newest first.
     pub fn kv_list_recent(&self, bucket: &str, prefix: &str, limit: usize) -> Vec<(String, Value)> {
+        let mut rows = self.kv_list_recent_raw(bucket, prefix, limit);
+        self.moved_notes(bucket, &mut rows);
+        rows
+    }
+
+    fn kv_list_recent_raw(&self, bucket: &str, prefix: &str, limit: usize) -> Vec<(String, Value)> {
         let conn = self.reader();
         let Ok(mut statement) = conn.prepare(
             "SELECT key, value FROM app_kv WHERE bucket = ? AND key GLOB ?2 ORDER BY updated DESC LIMIT ?3",
@@ -1387,6 +1560,23 @@ impl Store {
             return Vec::new();
         };
         let rows = statement.query_map(params![bucket, glob_prefix(prefix), limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        let Ok(rows) = rows else { return Vec::new() };
+        rows.flatten().filter_map(|(key, value)| serde_json::from_str(&value).ok().map(|v| (key, v))).collect()
+    }
+
+    /// The rows under a prefix whose keys sort before `before` (all of them
+    /// when it is empty), the greatest key first, at most `limit`: a chat
+    /// read a page at a time back from its newest message.
+    pub fn kv_page(&self, bucket: &str, prefix: &str, before: &str, limit: usize) -> Vec<(String, Value)> {
+        let conn = self.reader();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT key, value FROM app_kv WHERE bucket = ?1 AND key GLOB ?2 AND (?3 = '' OR key < ?3) ORDER BY key DESC LIMIT ?4",
+        ) else {
+            return Vec::new();
+        };
+        let rows = statement.query_map(params![bucket, glob_prefix(prefix), before, limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         });
         let Ok(rows) = rows else { return Vec::new() };
@@ -1428,6 +1618,16 @@ impl Store {
     /// Rows under a prefix written at or after `since`, with their write time:
     /// how an in-memory copy of a bucket catches up without re-reading it all.
     pub fn kv_list_since(&self, bucket: &str, prefix: &str, since: f64) -> Vec<(String, Value, f64)> {
+        let rows = self.kv_list_since_raw(bucket, prefix, since);
+        rows.into_iter()
+            .map(|(key, mut value, updated)| {
+                self.moved_note(bucket, &key, &mut value);
+                (key, value, updated)
+            })
+            .collect()
+    }
+
+    fn kv_list_since_raw(&self, bucket: &str, prefix: &str, since: f64) -> Vec<(String, Value, f64)> {
         let conn = self.reader();
         let mut statement = match conn.prepare(
             "SELECT key, value, updated FROM app_kv WHERE bucket = ? AND key GLOB ?2 AND updated >= ?3",
@@ -1685,9 +1885,8 @@ impl Store {
     /// Append one row. Reading the head and inserting under the same lock is
     /// what keeps the chain contiguous under concurrency.
     /// Append one row, stamped with the request's `via` when one is in
-    /// scope — Python's `service.record()`. Rows copied verbatim from
-    /// another scope (a repo move) go through `ledger_append_raw`, as
-    /// Python's move writes them through the driver, unstamped.
+    /// scope. Rows copied verbatim from another scope (a repo move) go
+    /// through `ledger_append_raw`, unstamped.
     pub fn ledger_append(
         &self, scope: &str, kind: &str, payload: &Value, ts: f64,
     ) -> rusqlite::Result<Value> {
@@ -1757,8 +1956,8 @@ impl Store {
         }))
     }
 
-    /// Every scope that already carries data. Matches the Python driver:
-    /// distinct scopes in shared_trees, which is what the alias registry
+    /// Every scope that already carries data: distinct scopes in
+    /// shared_trees, which is what the alias registry
     /// seeds from.
     pub fn list_scopes(&self, prefix: &str) -> Vec<String> {
         if let Some(mem) = &self.mem {
@@ -1771,18 +1970,17 @@ impl Store {
         ) else {
             return Vec::new();
         };
-        // GLOB, like the Python side, so a '[' in a scope cannot become a
+        // GLOB with '[' escaped, so a '[' in a scope cannot become a
         // character class
         let pattern = glob_prefix(prefix);
         let rows = statement.query_map(params![pattern], |row| row.get::<_, String>(0));
         rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
-    /// Distinct scopes with at least one ledger row at or after `since_ts`,
-    /// matching the Python driver's `count_active_scopes` byte for byte —
-    /// including its quirk of binding `prefix` straight into a `LIKE ... ||
-    /// '%'` with no escaping, so a literal `%` or `_` in a workspace id acts
-    /// as a wildcard on both sides. Billing's monthly active-repo count reads
+    /// Distinct scopes with at least one ledger row at or after `since_ts`.
+    /// Note `prefix` is bound straight into a `LIKE ... || '%'` with no
+    /// escaping, so a literal `%` or `_` in a workspace id acts as a
+    /// wildcard. Billing's monthly active-repo count reads
     /// this: repos with real activity this month, not every scope that has
     /// ever accreted from auto-registration. -1 signals "couldn't answer" —
     /// a poisoned lock or a query error — so the caller can fall back to the
@@ -1817,6 +2015,15 @@ impl Store {
         self.ledger_since_of(scope, ts, None)
     }
 
+    /// When this scope's first ledger row was written: when Cork started
+    /// recording in the repo.
+    pub fn ledger_first_ts(&self, scope: &str) -> Option<f64> {
+        let conn = self.reader();
+        conn.query_row("SELECT MIN(ts) FROM ledger WHERE scope = ?", params![scope], |row| row.get::<_, Option<f64>>(0))
+            .ok()
+            .flatten()
+    }
+
     /// `ledger_since`, only rows of these kinds. In a busy repo most rows
     /// are gate checks; a reader that wants edits filters before copying,
     /// which keeps the tail's lock short for the appends waiting on it.
@@ -1838,17 +2045,21 @@ impl Store {
                     if ts >= held.from_ts {
                         held.used.store(stamp.to_bits(), Ordering::Relaxed);
                         self.tail_reads.fetch_add(1, Ordering::Relaxed);
-                        return held.since(ts, kinds);
+                        let rows = held.since(ts, kinds);
+                        drop(held);
+                        return self.moved_rows(scope, rows);
                     }
                 }
             }
         }
         self.disk_reads.fetch_add(1, Ordering::Relaxed);
-        let rows = self.ledger_since_disk(scope, ts);
-        match kinds {
-            Some(kinds) => rows.into_iter().filter(|row| kinds.contains(&row.kind.as_str())).collect(),
-            None => rows,
-        }
+        let rows = match kinds {
+            // filtered in SQL: a weeks-long window of a busy repo is mostly
+            // gate checks, and parsing every one only to drop it was the cost
+            Some(kinds) => ledger_rows_since_kinds(&self.reader(), scope, ts, kinds),
+            None => self.ledger_since_disk(scope, ts),
+        };
+        self.moved_rows(scope, rows)
     }
 
     /// Make a repo's tail: read its rows since `from_ts` under the writer, so
@@ -1911,6 +2122,17 @@ impl Store {
         if needles.is_empty() {
             return Vec::new();
         }
+        // a row written before a path moved holds the old path: search for
+        // the old spellings too, then keep only the rows that, translated,
+        // hold what was asked for (a new file at the old path is not it)
+        let moves = self.path_moves(scope);
+        let older: Vec<String> = moves
+            .as_ref()
+            .map(|m| needles.iter().flat_map(|n| m.old_spellings(n)).filter(|n| !needles.contains(&n.as_str())).collect())
+            .unwrap_or_default();
+        let all: Vec<&str> = needles.iter().copied().chain(older.iter().map(String::as_str)).collect();
+        let needles_asked = needles;
+        let needles = &all[..];
         let conn = self.reader();
         let clause = needles.iter().map(|_| "instr(payload, ?) > 0").collect::<Vec<_>>().join(" OR ");
         let sql = format!("SELECT seq, kind, payload, ts FROM ledger WHERE scope = ? AND ts >= ? AND ({clause}) ORDER BY seq ASC");
@@ -1921,8 +2143,26 @@ impl Store {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, f64>(3)?))
         });
         let Ok(rows) = rows else { return Vec::new() };
+        let Some(moves) = moves else {
+            return rows
+                .flatten()
+                .filter_map(|(seq, kind, payload, ts)| serde_json::from_str(&payload).ok().map(|payload| LedgerRow { seq, kind, payload, ts }))
+                .collect();
+        };
         rows.flatten()
-            .filter_map(|(seq, kind, payload, ts)| serde_json::from_str(&payload).ok().map(|payload| LedgerRow { seq, kind, payload, ts }))
+            .filter_map(|(seq, kind, raw, ts)| {
+                let mut payload: Value = serde_json::from_str(&raw).ok()?;
+                let asked = needles_asked.iter().any(|n| raw.contains(n));
+                if ts < moves.latest && moves.translate(&mut payload, ts) && !asked {
+                    let text = canonical_sorted(&payload);
+                    if !needles_asked.iter().any(|n| text.contains(n)) {
+                        return None;
+                    }
+                } else if !asked {
+                    return None;
+                }
+                Some(LedgerRow { seq, kind, payload, ts })
+            })
             .collect()
     }
 
@@ -1938,6 +2178,25 @@ fn ledger_rows_after_seq(conn: &Connection, scope: &str, seq: i64) -> Vec<Ledger
         return Vec::new();
     };
     let rows = statement.query_map(params![scope, seq], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, f64>(3)?))
+    });
+    let Ok(rows) = rows else { return Vec::new() };
+    rows.flatten()
+        .filter_map(|(seq, kind, payload, ts)| serde_json::from_str(&payload).ok().map(|payload| LedgerRow { seq, kind, payload, ts }))
+        .collect()
+}
+
+/// [`ledger_rows_since`], only rows of these kinds, filtered by the query.
+fn ledger_rows_since_kinds(conn: &Connection, scope: &str, ts: f64, kinds: &[&str]) -> Vec<LedgerRow> {
+    if kinds.is_empty() {
+        return Vec::new();
+    }
+    let marks = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT seq, kind, payload, ts FROM ledger WHERE scope = ? AND ts >= ? AND kind IN ({marks}) ORDER BY seq ASC");
+    let Ok(mut statement) = conn.prepare(&sql) else { return Vec::new() };
+    let mut values: Vec<rusqlite::types::Value> = vec![scope.to_string().into(), ts.into()];
+    values.extend(kinds.iter().map(|k| rusqlite::types::Value::from(k.to_string())));
+    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, f64>(3)?))
     });
     let Ok(rows) = rows else { return Vec::new() };
@@ -1969,12 +2228,68 @@ fn ledger_rows_since(conn: &Connection, scope: &str, ts: f64) -> Vec<LedgerRow> 
 }
 
 impl Store {
+    /// A few top-level string fields of one scope's rows of these kinds after
+    /// `since`, newest first, at most `limit`: `(ts, kind, [field values])`,
+    /// "" for a field a row lacks. SQLite reads the fields out of the stored
+    /// JSON, so a counter (unread.rs) never parses an edit's hunks and
+    /// events; the (scope, ts) index bounds the walk.
+    pub fn ledger_fields_since(
+        &self, scope: &str, since: f64, kinds: &[&str], fields: &[&str], limit: usize,
+    ) -> Vec<(f64, String, Vec<String>)> {
+        if kinds.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let marks = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let picks: String = fields
+            .iter()
+            .map(|f| {
+                let clean: String = f.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                format!(", COALESCE(CAST(json_extract(payload, '$.{clean}') AS TEXT), '')")
+            })
+            .collect();
+        let sql = format!(
+            "SELECT ts, kind{picks} FROM ledger WHERE scope = ? AND ts > ? AND kind IN ({marks}) ORDER BY ts DESC LIMIT ?"
+        );
+        let moves = self.path_moves(scope);
+        let conn = self.reader();
+        let Ok(mut statement) = conn.prepare(&sql) else { return Vec::new() };
+        let mut values: Vec<rusqlite::types::Value> = vec![scope.to_string().into(), since.into()];
+        values.extend(kinds.iter().map(|k| rusqlite::types::Value::from(k.to_string())));
+        values.push((limit.min(i64::MAX as usize) as i64).into());
+        let width = fields.len();
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            let mut picked = Vec::with_capacity(width);
+            for i in 0..width {
+                picked.push(row.get::<_, String>(i + 2).unwrap_or_default());
+            }
+            Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?, picked))
+        });
+        let Ok(rows) = rows else { return Vec::new() };
+        let mut rows: Vec<(f64, String, Vec<String>)> = rows.flatten().collect();
+        // a field read out of a row written before a move reads as moved
+        if let Some(moves) = moves {
+            for (ts, _, picked) in rows.iter_mut().filter(|(ts, _, _)| *ts < moves.latest) {
+                for value in picked.iter_mut() {
+                    if let Some(moved) = moves.translate_str(value, *ts) {
+                        *value = moved;
+                    }
+                }
+            }
+        }
+        rows
+    }
+
     /// A page of one scope's history, newest first internally but returned
-    /// oldest-first within the page — matching the Python driver's `tail`,
-    /// which the dashboard and the public worklog page both read directly.
+    /// oldest-first within the page, which the dashboard and the public
+    /// worklog page both read directly.
     /// `before_seq` is an exclusive cursor: pass the oldest `seq` already
     /// shown to page further back.
     pub fn ledger_tail(&self, scope: &str, limit: i64, before_seq: Option<i64>) -> Vec<LedgerRow> {
+        let rows = self.ledger_tail_raw(scope, limit, before_seq);
+        self.moved_rows(scope, rows)
+    }
+
+    fn ledger_tail_raw(&self, scope: &str, limit: i64, before_seq: Option<i64>) -> Vec<LedgerRow> {
         let conn = self.reader();
         let rows = if let Some(before_seq) = before_seq {
             let mut statement = match conn.prepare(
@@ -2016,6 +2331,23 @@ impl Store {
     /// different question (rows after a timestamp) and its `LedgerRow`
     /// shape has no seq/hash for a caller to page or verify a chain link by.
     pub fn ledger_page(&self, scope: &str, limit: i64, before_seq: Option<i64>) -> Vec<Value> {
+        let mut rows = self.ledger_page_raw(scope, limit, before_seq);
+        // the payload as every other read shows it; hash and prev_hash are
+        // the chain's, over the payload as written (verification reads disk)
+        if let Some(moves) = self.path_moves(scope) {
+            for row in rows.iter_mut() {
+                let ts = row.get("ts").and_then(Value::as_f64).unwrap_or(f64::MAX);
+                if ts < moves.latest {
+                    if let Some(payload) = row.get_mut("payload") {
+                        moves.translate(payload, ts);
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    fn ledger_page_raw(&self, scope: &str, limit: i64, before_seq: Option<i64>) -> Vec<Value> {
         let conn = self.reader();
         let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
             let seq: i64 = row.get(0)?;
@@ -2074,8 +2406,8 @@ impl Store {
             .unwrap_or(0)
     }
 
-    /// Re-verify the chain the way the Python server does: walk every row in
-    /// sequence and recompute each link. Returns (ok, first bad seq, rows).
+    /// Re-verify the chain: walk every row in sequence and recompute each
+    /// link. Returns (ok, first bad seq, rows).
     /// The chain's verdict: `(ok, bad_seq, rows)` — `rows` is the table's
     /// total, the global chain length.
     pub fn ledger_verify(&self) -> (bool, Option<i64>, i64) {
@@ -2093,7 +2425,7 @@ impl Store {
     /// is altered); everything is re-walked once per [`FULL_WALK_EVERY_S`],
     /// when the anchor row itself changed, or on `force_full` (the route's
     /// `?verify=full`). So a tampered OLD row shows within the hour or on
-    /// demand; a bad NEW row shows at once. Python's `_verify_at`.
+    /// demand; a bad NEW row shows at once.
     pub fn ledger_verify_at(&self, at: f64, force_full: bool) -> ((bool, Option<i64>, i64), i64) {
         let Ok(mut check) = self.chain_check.lock() else { return ((false, None, 0), 0) };
         let conn = self.reader();
@@ -2135,7 +2467,7 @@ impl Store {
 
 /// Verify every row past `after_seq`, linking from `start_hash`: the
 /// verdict (with `rows` = the table's total), how many rows were walked, and
-/// the last sound `(seq, hash)` — the next anchor. Python's `_walk`.
+/// the last sound `(seq, hash)` — the next anchor.
 fn walk_chain(conn: &Connection, after_seq: i64, start_hash: &str) -> ((bool, Option<i64>, i64), i64, Option<(i64, String)>) {
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM ledger", [], |row| row.get(0)).unwrap_or(0);
     let Ok(mut statement) = conn.prepare(
@@ -2176,9 +2508,8 @@ fn walk_chain(conn: &Connection, after_seq: i64, start_hash: &str) -> ((bool, Op
     ((true, None, total), walked, tail)
 }
 
-/// `json.dumps(payload, sort_keys=True)` — note the Python side stores the
-/// ledger payload with DEFAULT separators, not the compact ones used for the
-/// chain hash. Reproduced exactly so a row written here is byte-identical.
+/// Note the ledger payload is stored with DEFAULT separators, not the
+/// compact ones used for the chain hash.
 #[allow(dead_code)]
 /// The stored payload text: `json.dumps(payload, sort_keys=True)`. Sorted
 /// explicitly — the map now preserves insertion order for the artifacts
@@ -2187,8 +2518,9 @@ pub fn canonical_sorted(value: &Value) -> String {
     python_dumps(&crate::hashing::sorted(value))
 }
 
-/// Python's `json.dumps` default formatting: ", " between items and ": "
-/// after keys, keys sorted.
+/// The stored JSON format, Python's `json.dumps` defaults: ", " between
+/// items and ": " after keys, non-ASCII escaped as `\uXXXX`. Every stored
+/// row was written this way; do not change it.
 pub fn python_dumps(value: &Value) -> String {
     match value {
         Value::Object(map) => {
@@ -2205,8 +2537,7 @@ pub fn python_dumps(value: &Value) -> String {
             let inner = items.iter().map(python_dumps).collect::<Vec<_>>().join(", ");
             format!("[{inner}]")
         }
-        // same reason as the chain hash: Python stores this column with
-        // ensure_ascii, and a row written here has to be byte-identical
+        // same reason as the chain hash: the column is stored ASCII-escaped
         Value::String(text) => crate::hashing::ascii_string(text),
         other => other.to_string(),
     }
@@ -2249,9 +2580,8 @@ impl Store {
 }
 
 /// The GLOB pattern that matches every key starting with `prefix`, with the
-/// one GLOB metacharacter a key can carry (`[`) escaped. Byte for byte the
-/// Python driver's `prefix.replace("[", "[[]") + "*"`: GLOB reads `_` and
-/// `%` literally, which is the whole reason the scans use it over LIKE.
+/// one GLOB metacharacter a key can carry (`[`) escaped
+/// (`prefix.replace("[", "[[]") + "*"`): GLOB reads `_` and `%` literally, which is the whole reason the scans use it over LIKE.
 fn glob_prefix(prefix: &str) -> String {
     format!("{}*", prefix.replace('[', "[[]"))
 }
@@ -2310,8 +2640,6 @@ mod tests {
         Store::open(Path::new(":memory:")).expect("in-memory store")
     }
 
-    /// Python's `test_verify_walks_only_what_is_new_and_re_anchors_on_demand`,
-    /// step for step.
     fn temp_db(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("collide-store-{name}-{}-{}", std::process::id(), now()));
         let _ = std::fs::create_dir_all(&dir);
@@ -2550,7 +2878,7 @@ mod tests {
     #[test]
     fn prefix_scans_read_underscore_and_percent_literally() {
         // `_` and `%` are LIKE wildcards; a repo id can carry both. The scans
-        // use GLOB with `[` escaped, as Python's driver does, so a per-scope
+        // use GLOB with `[` escaped, so a per-scope
         // read of api_v2 never returns api-v2's rows (or api[v2]'s).
         let store = open_memory();
         for scope in ["ws:acme/api_v2", "ws:acme/api-v2", "ws:acme/api%v2", "ws:acme/api[v2]"] {
@@ -2586,5 +2914,50 @@ mod tests {
         // a prefix that matches nothing answers zero, not -1 (the "query
         // failed" sentinel is reserved for an actual error).
         assert_eq!(store.count_active_scopes("ws-none:", 0.0), 0);
+    }
+}
+
+#[cfg(test)]
+mod storage_ported_tests {
+    use super::*;
+
+    fn open_memory() -> Store {
+        Store::open(Path::new(":memory:")).expect("in-memory store")
+    }
+
+    #[test]
+    fn an_expired_ephemeral_row_is_gone_from_reads_and_scans() {
+        let store = open_memory();
+        store.eph_set("intent:x:1", &serde_json::json!({"id": "1"}), Some(0.05)).unwrap();
+        store.eph_set("intent:x:2", &serde_json::json!({"id": "2"}), Some(60.0)).unwrap();
+        assert_eq!(store.eph_get("intent:x:1"), Some(serde_json::json!({"id": "1"})));
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(store.eph_get("intent:x:1"), None);
+        let live: Vec<String> = store.eph_scan("intent:x:").into_iter().map(|(k, _)| k).collect();
+        assert_eq!(live, vec!["intent:x:2".to_string()]);
+    }
+
+    #[test]
+    fn file_records_are_kept_per_user() {
+        let store = open_memory();
+        let record = serde_json::json!({"status": "clean", "last_clean": {"symbols": {}, "ts": 1.0}});
+        store.put_file("t:r", "alice", "a.py", &record, 1.0).unwrap();
+        assert_eq!(store.get_file("t:r", "alice", "a.py"), Some(record.clone()));
+        assert_eq!(store.get_file("t:r", "bob", "a.py"), None);
+        store.put_file("t:r", "bob", "a.py", &record, 2.0).unwrap();
+        let users: BTreeSet<String> = store.get_file_all_users("t:r", "a.py").into_iter().map(|(u, _)| u).collect();
+        assert_eq!(users, ["alice".to_string(), "bob".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn ledger_reads_are_scoped() {
+        let store = open_memory();
+        store.ledger_append("t:r1", "a", &serde_json::json!({}), 10.0).unwrap();
+        store.ledger_append("t:r2", "b", &serde_json::json!({}), 11.0).unwrap();
+        store.ledger_append("t:r1", "c", &serde_json::json!({}), 12.0).unwrap();
+        let tail: Vec<String> = store.ledger_tail("t:r1", 100, None).into_iter().map(|r| r.kind).collect();
+        assert_eq!(tail, vec!["a".to_string(), "c".to_string()]);
+        let since: Vec<String> = store.ledger_since("t:r1", 11.0).into_iter().map(|r| r.kind).collect();
+        assert_eq!(since, vec!["c".to_string()]);
     }
 }

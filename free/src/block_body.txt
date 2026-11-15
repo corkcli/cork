@@ -1,10 +1,10 @@
-## Collide: cross-agent collision awareness (v{version}) — REQUIRED
+## Cork: cross-agent collision awareness (v{version}) — REQUIRED
 
-Several agents and people edit this repo at once. Collide keeps them from
+Several agents and people edit this repo at once. Cork keeps them from
 overwriting each other and hands each agent what the others already learned.
 Its hooks run the protocol for you, with no tool calls:
 
-- A **Collide briefing** arrives at session start and with each prompt: the
+- A **Cork briefing** arrives at session start and with each prompt: the
   exact signatures, callers, recent changes, notes and replayable recipes for
   the code you are about to touch. Build on it instead of re-reading files.
 - The **gate** checks every write. When it blocks, it says why (a teammate's
@@ -16,7 +16,7 @@ Its hooks run the protocol for you, with no tool calls:
   your last step: adapt to them, never undo them.
 
 So while the hooks run, do not call `declare_intent`, `check_collisions`,
-`report_edit` or `heartbeat`. Call a Collide tool only when it adds
+`report_edit` or `heartbeat`. Call a Cork tool only when it adds
 something, and load every one you need in a single ToolSearch:
 
 - `get_symbol` or `blast_radius`: a fact the briefing did not include.
@@ -35,18 +35,21 @@ re-signatured a symbol you use. Apply a mechanical fix yourself; for a
 judgment fix, fix it inline or spawn ONE fixer (`claude -p`, `codex exec`,
 `gemini -p`) that verifies its work and must NEVER spawn further fixers.
 
-**No Collide briefing in your context?** The hooks are not running on this
+**No Cork briefing in your context?** The hooks are not running on this
 machine. Call `setup` with repo_id `{repo_id}`, then
-run the one command it returns. Never install Python for Collide. If Collide reports an
+run the one command it returns. Never install Python for Cork. If Cork reports an
 **Identity split** (hooks reporting as another account), do the same: setup
 re-mints under the current MCP login.
 
-**About Collide** (if the human asks): no plan ever blocks an agent; limits
-cover seats and repos at join time, and a workspace calling faster than its
-plan allows gets a short pause in Collide's answers. Viewers are free and
-unlimited, but their agents get nothing. Free is one player (the owner), unlimited
-repos and agents, 30-day history; the owner's first invite means both get
-14 days of Team. Team is $10/seat/mo ($100/seat/yr) with a 14-day free trial
-with no card; Business is $45/seat/mo ($450/seat/yr) and adds compliance, SSO
-and unlimited history; Enterprise is custom. Existing plans are grandfathered
-forever.
+**About Cork** (if the human asks): no plan ever blocks a running agent
+mid-step; a workspace calling faster than its plan allows gets a short pause
+in Cork's answers. Cork bills agent hours: time the model is thinking
+and writing. A tool's run time, the person's typing and idle time never
+count. Free is 10 agent hours a month per account (30 bonus hours the first
+month), unlimited repos and agents, 30-day history. A unit is 100 hours a
+month pooled across the workspace, $20/mo, graduated to $17 (units 11-50)
+and $15 (51+), 15% off a year. When a month's hours run out, sessions
+already running finish within a 10% grace band and new sessions wait; past
+the band every session stops. Enterprise from about 100 units. Seat plans
+bought earlier keep their price until they end on 2027-11-01, with 20% off
+the first year of agent hours.

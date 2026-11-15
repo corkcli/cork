@@ -19,7 +19,7 @@ use crate::store::{now, Store};
 
 /// True when a repo id already owns a persisted tree — the signal that
 /// aliasing it away would orphan real history.
-fn scope_has_data(store: &Store, aliases: &Aliases, workspace_id: &str, repo_id: &str) -> bool {
+pub(crate) fn scope_has_data(store: &Store, aliases: &Aliases, workspace_id: &str, repo_id: &str) -> bool {
     let scope = aliases.scope_for(workspace_id, repo_id);
     store.list_scopes(&format!("{workspace_id}:")).contains(&scope)
 }
@@ -164,4 +164,118 @@ pub fn adopt_origin(
         now(),
     );
     new_id
+}
+
+#[cfg(test)]
+mod rename_ported_tests {
+    use super::*;
+
+    fn store_with(scopes: &[&str]) -> (Store, Aliases) {
+        let store = Store::open(std::path::Path::new(":memory:")).expect("in-memory store");
+        for scope in scopes {
+            store.put_tree(scope, "alice", &json!({"root": "r", "dirs": {}, "files": {}}), 1.0).unwrap();
+        }
+        let aliases = Aliases::new();
+        aliases.seed(&scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        (store, aliases)
+    }
+
+    #[test]
+    fn seeding_prefers_the_qualified_canonical() {
+        let (_, aliases) = store_with(&["ws1:github.com/acme/agentmemory"]);
+        assert_eq!(aliases.resolve("ws1", "agentmemory"), "github.com/acme/agentmemory");
+        assert_eq!(aliases.resolve("ws1", "github.com/acme/agentmemory"), "github.com/acme/agentmemory");
+        assert_eq!(aliases.resolve("ws2", "agentmemory"), "agentmemory");
+    }
+
+    #[test]
+    fn ambiguous_basenames_are_not_merged() {
+        let (_, aliases) = store_with(&["ws1:github.com/acme/app", "ws1:github.com/other/app"]);
+        assert_eq!(aliases.resolve("ws1", "github.com/acme/app"), "github.com/acme/app");
+        assert_eq!(aliases.resolve("ws1", "github.com/other/app"), "github.com/other/app");
+        assert_eq!(aliases.resolve("ws1", "app"), "app");
+    }
+
+    #[test]
+    fn the_first_name_seen_claims_the_alias_at_runtime() {
+        let (_, aliases) = store_with(&[]);
+        assert_eq!(aliases.resolve("ws1", "widgets"), "widgets");
+        assert_eq!(aliases.resolve("ws1", "github.com/acme/widgets"), "widgets");
+        // branch-qualified ids are their own scope until the base is known
+        assert_eq!(normalize_repo_id("github.com/acme/app#main"), "app#main");
+        assert_ne!(normalize_repo_id("app#main"), normalize_repo_id("app#dev"));
+    }
+
+    #[test]
+    fn an_alias_redirects_the_new_name_onto_the_old_scope() {
+        let (store, aliases) = store_with(&["ws1:github.com/acme/agentmemory"]);
+        let result = alias_repo(&store, &aliases, "ws1", "github.com/acme/collide", "github.com/acme/agentmemory", "alice", false);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["canonical"], "github.com/acme/agentmemory");
+        assert_eq!(aliases.resolve("ws1", "github.com/acme/collide"), "github.com/acme/agentmemory");
+        assert_eq!(aliases.resolve("ws2", "github.com/acme/collide"), "github.com/acme/collide");
+        // and it is stored, for the next start to re-seed
+        assert!(store.kv_get("repo_alias", "ws1:github.com/acme/collide").is_some());
+    }
+
+    #[test]
+    fn an_alias_refuses_to_shadow_live_history_without_force() {
+        let (store, aliases) = store_with(&["ws1:github.com/acme/agentmemory", "ws1:github.com/acme/collide"]);
+        let refused = alias_repo(&store, &aliases, "ws1", "github.com/acme/collide", "github.com/acme/agentmemory", "alice", false);
+        assert_eq!((refused["ok"].clone(), refused["shadows_data"].clone()), (json!(false), json!(true)), "{refused}");
+        assert_eq!(aliases.resolve("ws1", "github.com/acme/collide"), "github.com/acme/collide");
+        let forced = alias_repo(&store, &aliases, "ws1", "github.com/acme/collide", "github.com/acme/agentmemory", "alice", true);
+        assert_eq!(forced["ok"], true, "{forced}");
+        assert_eq!(aliases.resolve("ws1", "github.com/acme/collide"), "github.com/acme/agentmemory");
+    }
+
+    const OLD: &str = "github.com/lithometric/agentmemory";
+    const NEW: &str = "github.com/lithometric/cork";
+
+    #[test]
+    fn a_rename_points_the_new_id_at_the_old_scope_without_moving_it() {
+        let (store, aliases) = store_with(&["ws1:github.com/lithometric/agentmemory"]);
+        let physical = aliases.resolve("ws1", OLD);
+        let result = rename_repo(&store, &aliases, "ws1", OLD, NEW, "alice", false);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["canonical"], json!(physical));
+        assert_eq!(result["preferred"], NEW);
+        // the new id resolves onto the same physical scope: no orphaned history
+        assert_eq!(aliases.resolve("ws1", NEW), physical);
+        // and the bare basename aligns to it too
+        assert_eq!(aliases.resolve("ws1", "cork"), physical);
+        // the old id hands the new one back; a client already on it has nothing to adopt
+        assert_eq!(crate::envelope::preferred_repo_id(&store, &aliases, "ws1", OLD), NEW);
+        assert_eq!(crate::envelope::preferred_repo_id(&store, &aliases, "ws1", NEW), "");
+        // idempotent
+        let again = rename_repo(&store, &aliases, "ws1", OLD, NEW, "alice", false);
+        assert_eq!((again["ok"].clone(), again["already"].clone()), (json!(true), json!(true)), "{again}");
+    }
+
+    #[test]
+    fn a_rename_refuses_to_bury_a_repo_that_owns_history() {
+        let (store, aliases) = store_with(&["ws1:github.com/lithometric/agentmemory", "ws1:github.com/lithometric/cork"]);
+        let blocked = rename_repo(&store, &aliases, "ws1", OLD, NEW, "alice", false);
+        assert_eq!((blocked["ok"].clone(), blocked["shadows_data"].clone()), (json!(false), json!(true)), "{blocked}");
+        let forced = rename_repo(&store, &aliases, "ws1", OLD, NEW, "alice", true);
+        assert_eq!(forced["ok"], true, "{forced}");
+    }
+
+    #[test]
+    fn a_github_rename_seen_by_watch_is_a_full_relink() {
+        let (store, aliases) = store_with(&["ws1:github.com/lithometric/agentmemory"]);
+        let physical = aliases.resolve("ws1", OLD);
+        let first = crate::watch::register_watch(&store, &aliases, "ws1", OLD, "12345", "alice");
+        assert_eq!(first["ok"], true, "{first}");
+        assert!(first.get("renamed_from").is_none());
+        // the same slug again is no rename
+        let same = crate::watch::register_watch(&store, &aliases, "ws1", OLD, "12345", "alice");
+        assert!(same.get("renamed_from").is_none(), "{same}");
+        // same numeric id, new slug: a rename
+        let moved = crate::watch::register_watch(&store, &aliases, "ws1", NEW, "12345", "alice");
+        assert_eq!(moved["renamed_from"], OLD, "{moved}");
+        assert_eq!(aliases.resolve("ws1", NEW), physical);
+        assert_eq!(crate::envelope::preferred_repo_id(&store, &aliases, "ws1", OLD), NEW);
+        assert_eq!(aliases.resolve("ws1", "cork"), physical);
+    }
 }

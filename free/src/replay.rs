@@ -6,7 +6,7 @@
 //! which notes existed and whether the ground under each had already moved.
 //! When something breaks, the state a call was made from says whether the
 //! information was wrong or the judgement was, which is what outcome scoring
-//! feeds on. Python's `insights.replay`, same shape, same order.
+//! feeds on.
 
 use std::collections::{BTreeMap, BTreeSet};
 

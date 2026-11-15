@@ -1,13 +1,12 @@
 //! Louvain community detection.
 //!
-//! This is the most expensive thing Collide computes. `repo_map` clusters the
+//! This is the most expensive thing Cork computes. `repo_map` clusters the
 //! symbol graph into subsystems, and `repo_map` is folded into every briefing,
 //! which is the first call every agent makes. The partition is cached by graph
 //! fingerprint — but the fingerprint moves on every reported edit, so on a
 //! busy repo the cache is cold exactly when the most agents are working.
-//! Measured on a synthetic 5,000-file graph, NetworkX takes 1.56s; this takes
-//! a fraction of that, which is the difference between a briefing that feels
-//! instant and one that stalls.
+//! It has to be fast: the difference between a briefing that feels instant
+//! and one that stalls.
 //!
 //! Standard two-phase Louvain: local moving to a modularity optimum, then
 //! aggregate each community into a super-node and repeat. Node visiting order
@@ -181,9 +180,9 @@ fn aggregate(graph: &Graph, labels: &[usize], count: usize) -> Graph {
     Graph::from_edges(count, &edges)
 }
 
-/// Modularity of a partition — used by the parity test to prove this finds a
-/// partition at least as good as NetworkX's, since Louvain is heuristic and
-/// two correct implementations need not agree node for node.
+/// Modularity of a partition: how good a clustering is. Louvain is
+/// heuristic, so two correct runs need not agree node for node; modularity is
+/// what compares them.
 pub fn modularity(edges: &[(usize, usize, f64)], labels: &[usize], resolution: f64) -> f64 {
     let node_count = labels.len();
     let graph = Graph::from_edges(node_count, edges);
@@ -274,7 +273,7 @@ pub fn louvain(
 }
 
 /// Modularity of a named partition, for callers holding names rather than
-/// indices (the parity test, and anything comparing two clusterings).
+/// indices (anything comparing two clusterings).
 pub fn modularity_named(
     named_edges: &[(String, String, f64)],
     communities: &[Vec<String>],
@@ -295,4 +294,55 @@ pub fn modularity_named(
         edges.push((ai, bi, *weight));
     }
     modularity(&edges, &labels, resolution)
+}
+
+#[cfg(test)]
+mod louvain_ported_tests {
+    use super::*;
+
+    /// Planted clusters: dense inside, one bridge edge between neighbours.
+    fn clustered_edges(clusters: usize, per_cluster: usize) -> Vec<(String, String, f64)> {
+        let mut edges = Vec::new();
+        for cluster in 0..clusters {
+            let members: Vec<String> = (0..per_cluster).map(|i| format!("c{cluster}_n{i}")).collect();
+            for (i, node) in members.iter().enumerate() {
+                for other in members.iter().skip(i + 1) {
+                    edges.push((node.clone(), other.clone(), 1.0));
+                }
+            }
+            if cluster > 0 {
+                edges.push((members[0].clone(), format!("c{}_n0", cluster - 1), 1.0));
+            }
+        }
+        edges
+    }
+
+    #[test]
+    fn planted_clusters_are_found_as_a_partition() {
+        let edges = clustered_edges(8, 10);
+        let parts = louvain(&edges, 1.0, 7, &[]);
+        let flat: Vec<&String> = parts.iter().flatten().collect();
+        let unique: std::collections::HashSet<&&String> = flat.iter().collect();
+        assert_eq!(flat.len(), 80, "every node, once");
+        assert_eq!(unique.len(), 80, "a partition, not an overlap");
+        assert!(modularity_named(&edges, &parts, 1.0) > 0.8);
+        assert_eq!(parts.len(), 8);
+    }
+
+    #[test]
+    fn the_same_seed_gives_the_same_partition() {
+        let edges = clustered_edges(12, 15);
+        let first = louvain(&edges, 1.0, 7, &[]);
+        assert_eq!(first, louvain(&edges, 1.0, 7, &[]));
+        assert!(modularity_named(&edges, &first, 1.0) > 0.8);
+    }
+
+    #[test]
+    fn isolated_nodes_survive_as_their_own_community() {
+        let edges = vec![("a".to_string(), "b".to_string(), 1.0), ("b".to_string(), "c".to_string(), 1.0)];
+        let parts = louvain(&edges, 1.0, 7, &["lonely".to_string()]);
+        let flat: std::collections::BTreeSet<&str> = parts.iter().flatten().map(String::as_str).collect();
+        assert_eq!(flat, ["a", "b", "c", "lonely"].into_iter().collect());
+        assert!(parts.contains(&vec!["lonely".to_string()]));
+    }
 }

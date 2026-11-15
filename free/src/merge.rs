@@ -214,7 +214,7 @@ pub fn blind_spots(
         "never_clean": never_clean,
         "stale": stale,
         "quiet_workspaces": quiet,
-        "note": "Collide is silent about these; treat its answers there as unreliable.",
+        "note": "Cork is silent about these; treat its answers there as unreliable.",
     })
 }
 
@@ -365,4 +365,171 @@ pub fn differential_check(store: &Store, scope: &str, mine_user: &str, other_use
         "users": [mine_user, other_user],
         "findings": findings,
     })
+}
+
+/// How far back a live session's unlanded work is looked for.
+const PREVIEW_LOOKBACK_S: f64 = 7_200.0;
+const PREVIEW_MAX_SYMBOLS: usize = 200;
+const PREVIEW_MAX_CONFLICTS: usize = 5;
+
+/// `simulate_merge` for one landing: the symbols this session is about to
+/// push (`changed`: `{path, symbol, kind}`, names only, from its hook's diff
+/// of its own commits), against the work other live sessions on the same
+/// branch have written and not landed. The same rule as `simulate_merge`,
+/// at session grain: only a symbol both sides changed counts; a one-sided
+/// add is in-flight work, not a conflict. Work already landed is skipped:
+/// the landing rebases onto it, and git says so if it conflicts. Work on
+/// another branch is skipped too: it meets this one when the branches merge
+/// (branches.rs). Advice only; nothing here ever stops a landing.
+pub fn preview_landing(store: &Store, scope: &str, user: &str, session: &str, changed: &[Value]) -> Value {
+    let stamp = now();
+    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    // path -> (symbol -> my kind)
+    let mut mine: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for entry in changed.iter().take(PREVIEW_MAX_SYMBOLS) {
+        let (path, symbol) = (text(entry, "path"), text(entry, "symbol"));
+        if !path.is_empty() && !symbol.is_empty() {
+            mine.entry(path).or_default().insert(symbol, text(entry, "kind"));
+        }
+    }
+    if mine.is_empty() || session.is_empty() {
+        return json!({"ok": true, "conflicts": []});
+    }
+    let branch = crate::branches::of(store, scope, user, session);
+    let since = stamp - PREVIEW_LOOKBACK_S;
+    // (user, session, path) -> when they last wrote it
+    let mut writers: BTreeMap<(String, String, String), f64> = BTreeMap::new();
+    for (_, copy) in store.eph_scan(&format!("copyhash:{scope}:")) {
+        let (u, s, p) = (text(&copy, "user"), text(&copy, "session"), text(&copy, "path"));
+        let ts = copy.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
+        if copy.get("wrote").and_then(Value::as_bool) == Some(true) && !s.is_empty() && mine.contains_key(&p) && ts >= since {
+            writers.insert((u, s, p), ts);
+        }
+    }
+    // the certain changes, with what they changed to (hot markers)
+    let mut details: BTreeMap<(String, String, String, String), Value> = BTreeMap::new();
+    for path in mine.keys() {
+        for (_, marker) in store.eph_scan(&format!("hot:{scope}:{}:", crate::repo::path_key(path))) {
+            let (u, s) = (text(&marker, "user"), text(&marker, "session"));
+            if text(&marker, "path") != *path || s.is_empty() {
+                continue;
+            }
+            let ts = marker.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
+            let seen = writers.entry((u.clone(), s.clone(), path.clone())).or_insert(ts);
+            *seen = seen.max(ts);
+            for event in marker.get("events").and_then(Value::as_array).into_iter().flatten() {
+                details.insert((u.clone(), s.clone(), path.clone(), text(event, "symbol")), event.clone());
+            }
+        }
+    }
+    writers.retain(|(u, s, _), _| {
+        !(u == user && s == session)
+            && store.eph_get(&format!("sessended:{scope}:{s}")).is_none()
+            && crate::branches::apart(store, scope, &branch, (u, s)).is_none()
+    });
+    if writers.is_empty() {
+        return json!({"ok": true, "conflicts": []});
+    }
+    // their reported edits and landings, read once
+    let rows = store.ledger_since_kinds(scope, since, &["edit_reported", "landed"]);
+    let mut conflicts: Vec<Value> = Vec::new();
+    let mut more = 0usize;
+    for ((u, s, path), last) in &writers {
+        let landed = rows.iter().any(|row| {
+            let by = text(&row.payload, "session");
+            row.kind == "landed" && row.ts >= *last && text(&row.payload, "user") == *u && (by.is_empty() || by == *s)
+        });
+        if landed {
+            continue;
+        }
+        let (mut added, mut touched): (BTreeSet<String>, BTreeSet<String>) = Default::default();
+        for row in rows.iter().filter(|r| r.kind == "edit_reported") {
+            let p = &row.payload;
+            if text(p, "user") != *u || text(p, "session") != *s || text(p, "path") != *path {
+                continue;
+            }
+            for event in p.get("events").and_then(Value::as_array).into_iter().flatten() {
+                let symbol = text(event, "symbol");
+                match text(event, "kind").as_str() {
+                    "added" => {
+                        added.insert(symbol);
+                    }
+                    // the other copy's change seen through this writer's diff
+                    "modified" if text(event, "confidence") == semantics::UNCONFIRMED => {}
+                    _ => {
+                        touched.insert(symbol);
+                    }
+                }
+            }
+        }
+        for (u2, s2, p2, symbol) in details.keys() {
+            if u2 == u && s2 == s && p2 == path {
+                touched.insert(symbol.clone());
+            }
+        }
+        let who = crate::inflight::author_label(store, user, u);
+        for (symbol, my_kind) in &mine[path] {
+            let both_add = my_kind == "added" && added.contains(symbol);
+            if !touched.contains(symbol) && !both_add {
+                continue;
+            }
+            if conflicts.len() >= PREVIEW_MAX_CONFLICTS {
+                more += 1;
+                continue;
+            }
+            let event = details.get(&(u.clone(), s.clone(), path.clone(), symbol.clone()));
+            let kind = match event.map(|e| text(e, "kind")) {
+                Some(k) if !k.is_empty() => k,
+                _ if both_add => "added".to_string(),
+                _ => "body".to_string(),
+            };
+            let to = event
+                .map(|e| {
+                    let new_name = text(e, "new_name");
+                    if new_name.is_empty() { text(e, "signature_after") } else { new_name }
+                })
+                .unwrap_or_default();
+            conflicts.push(json!({"path": path, "symbol": symbol, "who": who, "kind": kind, "now": to, "yours": my_kind}));
+        }
+    }
+    json!({"ok": true, "conflicts": conflicts, "more": more})
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn a_landing_hears_which_of_its_symbols_a_live_session_is_also_changing() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let scope = "w:r";
+        let path = "booking.py";
+        let h = crate::freshness::fingerprint_content("x\n");
+        for (u, s, b) in [("kevin@x.com", "k1", "main"), ("bob@x.com", "b1", "main"), ("alice@x.com", "a1", "feat/x")] {
+            crate::branches::note(&db, scope, u, s, b, "");
+            crate::freshness::saw(&db, scope, u, s, path, &h, true);
+        }
+        // bob re-signatures create_booking and has not landed; alice does the
+        // same on another branch
+        for (u, s) in [("bob@x.com", "b1"), ("alice@x.com", "a1")] {
+            let event = json!({"symbol": "create_booking", "kind": "signature", "confidence": "certain",
+                               "signature_after": "def create_booking(slot, user)"});
+            db.ledger_append(scope, "edit_reported", &json!({"user": u, "session": s, "path": path,
+                "events": [{"symbol": "create_booking", "kind": "modified", "confidence": "certain"}]}), now()).unwrap();
+            let _ = db.eph_set(&format!("hot:{scope}:{}:{u}#{s}", crate::repo::path_key(path)),
+                &json!({"path": path, "user": u, "session": s, "ts": now(), "events": [event]}), Some(600.0));
+        }
+        let changed = vec![json!({"path": path, "symbol": "create_booking", "kind": "body"}),
+                           json!({"path": path, "symbol": "cancel_booking", "kind": "body"})];
+        let answer = preview_landing(&db, scope, "kevin@x.com", "k1", &changed);
+        let conflicts = answer["conflicts"].as_array().unwrap();
+        assert_eq!(conflicts.len(), 1, "bob only, and only the symbol both change: {answer}");
+        assert_eq!(conflicts[0]["symbol"], "create_booking");
+        assert_eq!(conflicts[0]["who"], "bob@x.com");
+        assert_eq!(conflicts[0]["kind"], "signature");
+        assert_eq!(conflicts[0]["now"], "def create_booking(slot, user)");
+        // once bob lands, it is the landing's rebase to meet, not a prediction
+        db.ledger_append(scope, "landed", &json!({"user": "bob@x.com", "session": "b1"}), now() + 1.0).unwrap();
+        assert!(preview_landing(&db, scope, "kevin@x.com", "k1", &changed)["conflicts"].as_array().unwrap().is_empty());
+    }
 }

@@ -1,0 +1,1224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corkcli.com/protocol/v1/frames.schema.json",
+  "title": "Cork protocol v1 frames",
+  "description": "Every frame is a JSON text WebSocket message, an object tagged by `t`. ClientFrame goes client\u2192server, ServerFrame server\u2192client. Unknown fields must be ignored by receivers; this schema is strict so tests catch drift.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ClientFrame"
+    },
+    {
+      "$ref": "#/$defs/ServerFrame"
+    }
+  ],
+  "$defs": {
+    "ClientFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/client_hello"
+        },
+        {
+          "$ref": "#/$defs/client_op"
+        },
+        {
+          "$ref": "#/$defs/client_batch"
+        },
+        {
+          "$ref": "#/$defs/client_lease"
+        },
+        {
+          "$ref": "#/$defs/client_release"
+        },
+        {
+          "$ref": "#/$defs/client_subscribe"
+        },
+        {
+          "$ref": "#/$defs/client_unsubscribe"
+        },
+        {
+          "$ref": "#/$defs/client_check"
+        },
+        {
+          "$ref": "#/$defs/client_promote"
+        },
+        {
+          "$ref": "#/$defs/client_message"
+        }
+      ]
+    },
+    "ServerFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/server_welcome"
+        },
+        {
+          "$ref": "#/$defs/server_ack"
+        },
+        {
+          "$ref": "#/$defs/server_reject"
+        },
+        {
+          "$ref": "#/$defs/server_delta"
+        },
+        {
+          "$ref": "#/$defs/server_lease_granted"
+        },
+        {
+          "$ref": "#/$defs/server_lease_denied"
+        },
+        {
+          "$ref": "#/$defs/server_lease_released"
+        },
+        {
+          "$ref": "#/$defs/server_check_result"
+        },
+        {
+          "$ref": "#/$defs/server_promoted"
+        },
+        {
+          "$ref": "#/$defs/server_message"
+        },
+        {
+          "$ref": "#/$defs/server_error"
+        }
+      ]
+    },
+    "Hlc": {
+      "type": "object",
+      "properties": {
+        "w": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "c": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "w",
+        "c"
+      ],
+      "description": "Hybrid logical clock: wall ms + counter; ordered by (w, c).",
+      "additionalProperties": false
+    },
+    "Base": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hash": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string",
+          "description": "Hash of the content the writer has; used when hash is empty (SPEC \u00a75.1)."
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "description": "What a write is based on. An empty hash skips the hash check. A base may be named by content: {version: 0, hash: \"\", content: C} or {version: 0, hash: C} (SPEC.md \u00a75.1).",
+      "additionalProperties": false
+    },
+    "Head": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hash": {
+          "type": "string"
+        },
+        "promoted_version": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "version",
+        "hash"
+      ],
+      "description": "A key's head: draft version, its hash, highest promoted version.",
+      "additionalProperties": false
+    },
+    "Peer": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "person": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "description": "Who: session, agent, person. Filled by the server.",
+      "additionalProperties": false
+    },
+    "Intent": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "description": "Why: an intent id and/or a line of text.",
+      "additionalProperties": false
+    },
+    "MovedTo": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "version",
+        "hash"
+      ],
+      "description": "Where a rename/move sent a key's subject, and its head there.",
+      "additionalProperties": false
+    },
+    "Layer": {
+      "enum": [
+        "draft",
+        "promoted"
+      ]
+    },
+    "OpId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:@-]{1,128}$"
+    },
+    "Op": {
+      "type": "object",
+      "properties": {
+        "op_id": {
+          "$ref": "#/$defs/OpId"
+        },
+        "key": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "base": {
+          "$ref": "#/$defs/Base"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "public": {
+          "type": "object",
+          "description": "Kind-declared public fields the server may read."
+        },
+        "payload": {
+          "type": "string",
+          "description": "Opaque bytes, base64. Never read by the server."
+        },
+        "author": {
+          "$ref": "#/$defs/Peer"
+        },
+        "intent_id": {
+          "type": "string"
+        },
+        "hlc": {
+          "$ref": "#/$defs/Hlc"
+        },
+        "leased": {
+          "type": "boolean"
+        },
+        "content_hash": {
+          "type": "string",
+          "description": "Hash of the key's content after this op."
+        }
+      },
+      "required": [
+        "op_id",
+        "key",
+        "kind"
+      ],
+      "description": "One typed op on one key.",
+      "additionalProperties": false
+    },
+    "TheirOp": {
+      "type": "object",
+      "properties": {
+        "op_id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string"
+        },
+        "public": {
+          "type": "object"
+        },
+        "payload": {
+          "type": "string"
+        },
+        "author": {
+          "$ref": "#/$defs/Peer"
+        },
+        "intent_id": {
+          "type": "string"
+        },
+        "hlc": {
+          "$ref": "#/$defs/Hlc"
+        },
+        "layer": {
+          "$ref": "#/$defs/Layer"
+        }
+      },
+      "required": [
+        "op_id",
+        "key",
+        "version",
+        "kind",
+        "author",
+        "hlc",
+        "layer"
+      ],
+      "description": "Someone else's accepted op, as shown to a writer it affects.",
+      "additionalProperties": false
+    },
+    "CheckKey": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "base": {
+          "$ref": "#/$defs/Base"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "additionalProperties": false
+    },
+    "DomainInfo": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "prefixes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "coalesce_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "prefixes",
+        "kinds",
+        "coalesce_ms"
+      ],
+      "additionalProperties": false
+    },
+    "LeaseInfo": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "intent": {
+          "$ref": "#/$defs/Intent"
+        },
+        "head": {
+          "$ref": "#/$defs/Head"
+        }
+      },
+      "required": [
+        "key",
+        "kinds",
+        "head"
+      ],
+      "additionalProperties": false
+    },
+    "LeaseConflict": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "holder": {
+          "$ref": "#/$defs/Peer"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "intent": {
+          "$ref": "#/$defs/Intent"
+        }
+      },
+      "required": [
+        "key",
+        "holder",
+        "kinds"
+      ],
+      "additionalProperties": false
+    },
+    "CheckEntry": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "stale",
+            "leased",
+            "unknown_base"
+          ]
+        },
+        "current": {
+          "$ref": "#/$defs/Head"
+        },
+        "would": {
+          "enum": [
+            "accept",
+            "rebase",
+            "rekey",
+            "conflict"
+          ]
+        },
+        "rekeyed_to": {
+          "type": "string"
+        },
+        "theirs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TheirOp"
+          }
+        },
+        "holder": {
+          "$ref": "#/$defs/Peer"
+        },
+        "intent": {
+          "$ref": "#/$defs/Intent"
+        }
+      },
+      "required": [
+        "key",
+        "status",
+        "current"
+      ],
+      "additionalProperties": false
+    },
+    "PromotedKey": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "promoted_version": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "key",
+        "promoted_version"
+      ],
+      "additionalProperties": false
+    },
+    "client_hello": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "hello"
+        },
+        "proto": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "person": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        },
+        "resume": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "t",
+        "proto",
+        "session",
+        "agent_id",
+        "person",
+        "scope"
+      ],
+      "description": "First frame on a connection.",
+      "additionalProperties": false
+    },
+    "client_op": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "op"
+        },
+        "op_id": {
+          "$ref": "#/$defs/OpId"
+        },
+        "key": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "base": {
+          "$ref": "#/$defs/Base"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "public": {
+          "type": "object",
+          "description": "Kind-declared public fields the server may read."
+        },
+        "payload": {
+          "type": "string",
+          "description": "Opaque bytes, base64. Never read by the server."
+        },
+        "author": {
+          "$ref": "#/$defs/Peer"
+        },
+        "intent_id": {
+          "type": "string"
+        },
+        "hlc": {
+          "$ref": "#/$defs/Hlc"
+        },
+        "leased": {
+          "type": "boolean"
+        },
+        "content_hash": {
+          "type": "string",
+          "description": "Hash of the key's content after this op."
+        }
+      },
+      "required": [
+        "t",
+        "op_id",
+        "key",
+        "kind"
+      ],
+      "description": "Write one op.",
+      "additionalProperties": false
+    },
+    "client_batch": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "batch"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/OpId"
+        },
+        "atomic": {
+          "type": "boolean"
+        },
+        "ops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Op"
+          }
+        }
+      },
+      "required": [
+        "t",
+        "batch_id",
+        "ops"
+      ],
+      "description": "Several ops; atomic (default true) = all or nothing.",
+      "additionalProperties": false
+    },
+    "client_lease": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "lease"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "intent": {
+          "$ref": "#/$defs/Intent"
+        }
+      },
+      "required": [
+        "t",
+        "keys"
+      ],
+      "description": "Hold keys for the kinds you intend, while connected (+ grace).",
+      "additionalProperties": false
+    },
+    "client_release": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "release"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "t",
+        "keys"
+      ],
+      "description": "Give leases back.",
+      "additionalProperties": false
+    },
+    "client_subscribe": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "subscribe"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "t",
+        "keys"
+      ],
+      "description": "Hear about keys (and what they depend on, to depth).",
+      "additionalProperties": false
+    },
+    "client_unsubscribe": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "unsubscribe"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "t",
+        "keys"
+      ],
+      "description": "Stop hearing about keys.",
+      "additionalProperties": false
+    },
+    "client_check": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "check"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CheckKey"
+          }
+        }
+      },
+      "required": [
+        "t",
+        "keys"
+      ],
+      "description": "Pre-write gate: would these writes be accepted?",
+      "additionalProperties": false
+    },
+    "client_promote": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "promote"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "op_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence": {}
+      },
+      "required": [
+        "t",
+        "op_ids"
+      ],
+      "description": "Mark ops proven (tests passed, pushed).",
+      "additionalProperties": false
+    },
+    "client_message": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "message"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "to": {
+          "type": "string"
+        },
+        "anchor": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "text"
+      ],
+      "description": "Send text to a session/agent/person, or whoever is on a key.",
+      "additionalProperties": false
+    },
+    "server_welcome": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "welcome"
+        },
+        "proto": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session": {
+          "type": "string"
+        },
+        "resumed": {
+          "type": "boolean"
+        },
+        "hlc": {
+          "$ref": "#/$defs/Hlc"
+        },
+        "grace_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resumed_leases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LeaseInfo"
+          }
+        },
+        "resumed_subscriptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "domains": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainInfo"
+          }
+        }
+      },
+      "required": [
+        "t",
+        "proto",
+        "session",
+        "resumed",
+        "hlc",
+        "grace_ms",
+        "domains"
+      ],
+      "description": "Answer to hello.",
+      "additionalProperties": false
+    },
+    "server_ack": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "ack"
+        },
+        "op_id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hash": {
+          "type": "string"
+        },
+        "hlc": {
+          "$ref": "#/$defs/Hlc"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "batch_id": {
+          "type": "string"
+        },
+        "rebased_over": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TheirOp"
+          }
+        },
+        "rekeyed_to": {
+          "type": "string"
+        },
+        "moved_to": {
+          "$ref": "#/$defs/MovedTo"
+        },
+        "same_as": {
+          "type": "string",
+          "description": "The key already held what the op makes it: the op whose version has that content. Nothing was applied (SPEC \u00a75.2)."
+        }
+      },
+      "required": [
+        "t",
+        "op_id",
+        "key",
+        "version",
+        "hash",
+        "hlc",
+        "seq"
+      ],
+      "description": "The op is in the log.",
+      "additionalProperties": false
+    },
+    "server_reject": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "reject"
+        },
+        "op_id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "conflict",
+            "leased",
+            "invalid",
+            "stale_lease",
+            "batch_aborted",
+            "unknown_base"
+          ]
+        },
+        "current": {
+          "$ref": "#/$defs/Head"
+        },
+        "theirs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TheirOp"
+          }
+        },
+        "their_intent": {
+          "$ref": "#/$defs/Intent"
+        },
+        "holder": {
+          "$ref": "#/$defs/Peer"
+        },
+        "batch_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "op_id",
+        "key",
+        "reason",
+        "current"
+      ],
+      "description": "The op was not applied.",
+      "additionalProperties": false
+    },
+    "server_delta": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "delta"
+        },
+        "op": {
+          "$ref": "#/$defs/Op"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hash": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "layer": {
+          "$ref": "#/$defs/Layer"
+        },
+        "via": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "moved_to": {
+          "$ref": "#/$defs/MovedTo"
+        }
+      },
+      "required": [
+        "t",
+        "op",
+        "version",
+        "hash",
+        "seq",
+        "layer"
+      ],
+      "description": "Someone's op, pushed the moment it is accepted (or promoted).",
+      "additionalProperties": false
+    },
+    "server_lease_granted": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "lease_granted"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "intent": {
+          "$ref": "#/$defs/Intent"
+        },
+        "heads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Head"
+          }
+        }
+      },
+      "required": [
+        "t",
+        "keys",
+        "kinds",
+        "heads"
+      ],
+      "description": "You hold these keys.",
+      "additionalProperties": false
+    },
+    "server_lease_denied": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "lease_denied"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "holder": {
+          "$ref": "#/$defs/Peer"
+        },
+        "intent": {
+          "$ref": "#/$defs/Intent"
+        },
+        "conflicts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LeaseConflict"
+          }
+        }
+      },
+      "required": [
+        "t",
+        "keys",
+        "holder",
+        "conflicts"
+      ],
+      "description": "Someone holds a conflicting lease; you will be told when it is released.",
+      "additionalProperties": false
+    },
+    "server_lease_released": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "lease_released"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reason": {
+          "enum": [
+            "released",
+            "expired",
+            "superseded"
+          ]
+        },
+        "holder": {
+          "$ref": "#/$defs/Peer"
+        }
+      },
+      "required": [
+        "t",
+        "keys",
+        "reason",
+        "holder"
+      ],
+      "description": "Leases were let go.",
+      "additionalProperties": false
+    },
+    "server_check_result": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "check_result"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CheckEntry"
+          }
+        }
+      },
+      "required": [
+        "t",
+        "results"
+      ],
+      "description": "Answer to check.",
+      "additionalProperties": false
+    },
+    "server_promoted": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "promoted"
+        },
+        "req": {
+          "type": "string",
+          "description": "Client request id, echoed on the answer."
+        },
+        "op_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PromotedKey"
+          }
+        },
+        "unknown": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence": {}
+      },
+      "required": [
+        "t",
+        "op_ids",
+        "keys"
+      ],
+      "description": "Answer to promote.",
+      "additionalProperties": false
+    },
+    "server_message": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "message"
+        },
+        "from": {
+          "$ref": "#/$defs/Peer"
+        },
+        "to": {
+          "type": "string"
+        },
+        "anchor": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "hlc": {
+          "$ref": "#/$defs/Hlc"
+        }
+      },
+      "required": [
+        "t",
+        "from",
+        "text",
+        "hlc"
+      ],
+      "description": "A message from another session.",
+      "additionalProperties": false
+    },
+    "server_error": {
+      "type": "object",
+      "properties": {
+        "t": {
+          "const": "error"
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "fatal": {
+          "type": "boolean"
+        },
+        "req": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "code",
+        "message"
+      ],
+      "description": "Something went wrong; fatal closes the connection.",
+      "additionalProperties": false
+    }
+  }
+}

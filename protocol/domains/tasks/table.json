@@ -1,0 +1,41 @@
+{
+  "domain": "tasks",
+  "version": 1,
+  "prefixes": ["task:"],
+  "coalesce_ms": 0,
+  "kinds": {
+    "claim":      { "doc": "Take the task. Held as a lease, it lasts while the claimer's socket is open.", "public": [] },
+    "release":    { "doc": "Give the task back.", "public": [] },
+    "edit":       { "doc": "Rewrite the task's description or acceptance criteria.", "public": [] },
+    "set_status": { "doc": "Move the task to public.status (todo, doing, review, blocked...).", "public": ["status"] },
+    "comment":    { "doc": "Add a comment or a finding.", "public": [] },
+    "depend":     { "doc": "This task is blocked by public.target, a task key.", "public": ["target"] },
+    "undepend":   { "doc": "Drop a blocker (public.target).", "public": ["target"] },
+    "close":      { "doc": "Mark the task done.", "public": [] },
+    "merge":      { "doc": "Fold this duplicate into public.into; its key becomes task:<public.into>.", "public": ["into"], "moves_key": true }
+  },
+  "relations": {
+    "claim":      { "claim": "conflict", "release": "commute", "edit": "commute",  "set_status": "commute",  "comment": "commute", "depend": "commute",  "undepend": "commute", "close": "conflict", "merge": "rekey" },
+    "release":    { "claim": "conflict", "release": "commute", "edit": "commute",  "set_status": "commute",  "comment": "commute", "depend": "commute",  "undepend": "commute", "close": "commute",  "merge": "rekey" },
+    "edit":       { "claim": "commute",  "release": "commute", "edit": "conflict", "set_status": "commute",  "comment": "commute", "depend": "commute",  "undepend": "commute", "close": "conflict", "merge": "rekey" },
+    "set_status": { "claim": "commute",  "release": "commute", "edit": "commute",  "set_status": "conflict", "comment": "commute", "depend": "commute",  "undepend": "commute", "close": "conflict", "merge": "rekey" },
+    "comment":    { "claim": "commute",  "release": "commute", "edit": "commute",  "set_status": "commute",  "comment": "commute", "depend": "commute",  "undepend": "commute", "close": "commute",  "merge": "rekey" },
+    "depend":     { "claim": "commute",  "release": "commute", "edit": "commute",  "set_status": "commute",  "comment": "commute", "depend": "commute",  "undepend": "commute", "close": "conflict", "merge": "rekey" },
+    "undepend":   { "claim": "commute",  "release": "commute", "edit": "commute",  "set_status": "commute",  "comment": "commute", "depend": "commute",  "undepend": "commute", "close": "commute",  "merge": "rekey" },
+    "close":      { "claim": "conflict", "release": "commute", "edit": "conflict", "set_status": "conflict", "comment": "commute", "depend": "conflict", "undepend": "commute", "close": "commute",  "merge": "conflict" },
+    "merge":      { "claim": "conflict", "release": "commute", "edit": "commute",  "set_status": "commute",  "comment": "commute", "depend": "commute",  "undepend": "commute", "close": "conflict", "merge": "conflict" }
+  },
+  "notes": {
+    "claim/claim": "Someone else took the task first: pick another.",
+    "release/claim": "Releasing now would drop the claim someone else just made.",
+    "claim/close": "The task is done; there is nothing to take.",
+    "claim/merge": "The task was folded into another; the claim follows it there.",
+    "edit/edit": "Two rewrites of one description: merge locally.",
+    "set_status/set_status": "Two agents disagree about where the task stands.",
+    "close/claim": "Someone just started on it: ask before closing.",
+    "close/edit": "The criteria changed since you checked them.",
+    "close/depend": "A new blocker arrived since you checked.",
+    "merge/claim": "Someone is working on this duplicate: ask before folding it away.",
+    "comment/*": "Comments never conflict; they land in sequence order."
+  }
+}

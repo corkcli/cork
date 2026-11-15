@@ -1,0 +1,18 @@
+{
+  "name": "@corkcli/protocol",
+  "version": "0.1.0",
+  "description": "TypeScript client for Cork's real-time agent protocol: frames, a sans-IO client, a coalescer and a WebSocket wrapper.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test \"dist/test/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5"
+  }
+}

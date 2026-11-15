@@ -1,6 +1,6 @@
 //! Three-valued parse semantics: clean / partial / stale.
 //!
-//! The heart of the product, and the reason Collide can be trusted to say
+//! The heart of the product, and the reason Cork can be trusted to say
 //! "certain":
 //!
 //!   1. Information is only ever derived from clean parses. When the current
@@ -12,7 +12,7 @@
 //!
 //! Rule 3 is what makes the gate safe to block on. An agent saving a file
 //! mid-edit produces a broken parse constantly; if that read as "they deleted
-//! everything", Collide would block the whole team on every keystroke.
+//! everything", Cork would block the whole team on every keystroke.
 
 use serde_json::{json, Map, Value};
 
@@ -27,8 +27,7 @@ use serde_json::{json, Map, Value};
 /// `async fn`), and a parameter list that mostly survived (at least half the
 /// identifiers after the old name are still there, so a rename that adds a
 /// parameter still counts). Anything short of this is what it looks like: a
-/// symbol gone (pending removal) and a symbol added. Python's
-/// `RENAME_MAX_GAP_S` / `looks_like_rename`.
+/// symbol gone (pending removal) and a symbol added.
 pub const RENAME_MAX_GAP_S: f64 = 6.0 * 3600.0;
 
 /// `(head, tail)`: the signature before and after its own name, whitespace
@@ -300,4 +299,114 @@ pub fn serve(record: Option<&Value>, now: f64) -> Option<Served> {
         return Some(Served { symbols, freshness: STALE, age_s });
     }
     Some(Served { symbols, freshness: LIVE, age_s: 0.0 })
+}
+
+#[cfg(test)]
+mod semantics_ported_tests {
+    use super::*;
+
+    const CLEAN_PY: &str = "import os\n\ndef greet(name: str) -> str:\n    return f\"hi {name}\"\n\nclass Widget:\n    def method(self):\n        pass\n";
+    const BROKEN_PY: &str = "def greet(name: str) -> str\n    return f\"hi {name\"\n\ndef half_typed(\n";
+
+    /// One parse as the report pipeline folds it: (status, name -> symbol).
+    fn parsed(src: &str) -> (&'static str, Map<String, Value>) {
+        let out = cork_core::engine::parse("a.py", src).expect("python parses");
+        let symbols = out.symbols.iter().map(|s| (s.name.clone(), json!({
+            "name": s.name, "kind": s.kind, "signature": s.signature, "hash": s.hash,
+        }))).collect();
+        (out.status, symbols)
+    }
+
+    fn apply(record: Option<&Value>, src: &str, now: f64) -> (Value, Vec<Value>) {
+        let (status, symbols) = parsed(src);
+        apply_parse(record, status, symbols, now)
+    }
+
+    fn kinds_of(events: &[Value], symbol: &str) -> Vec<(String, String)> {
+        events.iter().filter(|e| e["symbol"] == symbol)
+            .map(|e| (e["kind"].as_str().unwrap_or("").to_string(), e["confidence"].as_str().unwrap_or("").to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_partial_parse_serves_the_last_clean_one_as_stale() {
+        let (record, _) = apply(None, CLEAN_PY, 100.0);
+        let (record, events) = apply(Some(&record), BROKEN_PY, 160.0);
+        assert!(events.is_empty(), "nothing is derived from a partial parse");
+        let served = serve(Some(&record), 160.0).expect("the clean parse is served");
+        assert_eq!((served.freshness, served.age_s), (STALE, 60.0));
+        assert!(served.symbols.contains_key("greet"), "a parse failure never removes a symbol");
+    }
+
+    #[test]
+    fn no_clean_parse_serves_nothing() {
+        let (record, events) = apply(None, BROKEN_PY, 1.0);
+        assert!(events.is_empty());
+        assert!(serve(Some(&record), 2.0).is_none());
+        assert!(serve(None, 2.0).is_none());
+    }
+
+    #[test]
+    fn a_rename_is_one_certain_event() {
+        let (record, _) = apply(None, "def old_name(a, b):\n    return a\n", 1.0);
+        let (_, events) = apply(Some(&record), "def new_name(a, b, c=None):\n    return a\n", 2.0);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!((events[0]["kind"].as_str(), events[0]["symbol"].as_str()), (Some("renamed"), Some("old_name")));
+        assert_eq!(events[0]["detail"]["new_name"], "new_name");
+        assert!(events[0]["detail"]["signature"].as_str().unwrap().contains("c=None"));
+        assert_eq!(events[0]["confidence"], CERTAIN);
+    }
+
+    #[test]
+    fn a_broken_interlude_then_a_rename_is_still_one_event() {
+        let (record, _) = apply(None, "def old_name():\n    return 1\n", 1.0);
+        let (record, mid) = apply(Some(&record), "def new_na(\n", 2.0);
+        assert!(mid.is_empty());
+        let (_, events) = apply(Some(&record), "def new_name():\n    return 1\n", 3.0);
+        let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
+        assert_eq!(kinds, vec!["renamed"]);
+    }
+
+    #[test]
+    fn a_removal_needs_two_consecutive_clean_parses() {
+        let two = "def keep():\n    pass\n\ndef gone():\n    pass\n\ndef also():\n    pass\n";
+        let one = "def keep():\n    pass\n\ndef also():\n    pass\n";
+        let (record, _) = apply(None, two, 1.0);
+        let (record, events) = apply(Some(&record), one, 2.0);
+        assert_eq!(kinds_of(&events, "gone"), vec![(UNKNOWN.to_string(), UNCONFIRMED.to_string())]);
+        let (_, events) = apply(Some(&record), one, 3.0);
+        assert_eq!(kinds_of(&events, "gone"), vec![("removed".to_string(), CERTAIN.to_string())]);
+    }
+
+    #[test]
+    fn a_partial_between_cleans_does_not_confirm_a_removal() {
+        let two = "def keep():\n    pass\n\ndef gone():\n    pass\n\ndef x():\n    pass\n";
+        let one = "def keep():\n    pass\n\ndef x():\n    pass\n";
+        let (record, _) = apply(None, two, 1.0);
+        let (record, _) = apply(Some(&record), one, 2.0);
+        let (record, events) = apply(Some(&record), "def keep(\n", 3.0);
+        assert!(events.is_empty());
+        // the symbol reappears: it never was a removal
+        let (record, events) = apply(Some(&record), two, 4.0);
+        assert_eq!(kinds_of(&events, "gone").first().map(|k| k.0.as_str()), Some("added"));
+        assert!(!events.iter().any(|e| e["kind"] == "removed"));
+        assert_eq!(record["pending_removed"], json!({}));
+    }
+
+    #[test]
+    fn a_docstring_change_modifies_only_that_symbol() {
+        let (record, _) = apply(None, "def a():\n    pass\n\ndef b():\n    pass\n", 1.0);
+        let (_, events) = apply(Some(&record), "def a():\n    \"\"\"doc\"\"\"\n    pass\n\ndef b():\n    pass\n", 2.0);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!((events[0]["symbol"].as_str(), events[0]["kind"].as_str()), (Some("a"), Some("modified")));
+        assert_eq!(events[0]["signature_change"], false);
+    }
+
+    #[test]
+    fn a_signature_change_is_flagged() {
+        let (record, _) = apply(None, "def f(a):\n    pass\n\ndef g():\n    pass\n", 1.0);
+        let (_, events) = apply(Some(&record), "def f(a, b):\n    pass\n\ndef g():\n    pass\n", 2.0);
+        assert_eq!(events[0]["kind"], "modified");
+        assert_eq!(events[0]["signature_change"], true);
+    }
 }

@@ -20,11 +20,10 @@ use crate::store::{now, Store};
 
 /// A counter that remembers what it saw first.
 ///
-/// Python's `Counter.most_common` breaks ties by insertion order, and the
-/// rows feeding these counters arrive in ledger sequence — so "first seen"
-/// means "happened earliest", which is a real ordering and the one the
-/// Python half reports. Sorting ties by name instead would be just as
-/// deterministic and quietly disagree on every tie.
+/// Ties break by insertion order, and the rows feeding these counters
+/// arrive in ledger sequence — so "first seen" means "happened earliest",
+/// which is a real ordering. Sorting ties by name instead would be just as
+/// deterministic and less meaningful.
 #[derive(Default)]
 struct Tally {
     counts: BTreeMap<String, i64>,
@@ -582,7 +581,9 @@ pub fn compliance_report(store: &Store, scope: &str, repo_id: &str, since: f64) 
             "brief_outcome" | "map_answered" | "deltas_delivered" | "batch_applied" | "collision_prevented" | "claim_prevented"
             | "setup_one_command" | "land_saved" => {
                 let messages = crate::briefstat::row_messages(payload) as i64;
-                let usd = payload.get("est_usd").and_then(Value::as_f64).unwrap_or(0.0);
+                // priced the one way every page prices a saving
+                let worth = crate::briefstat::row_saving(&row.kind, payload).unwrap_or_default();
+                let usd = worth.est_usd;
                 let slot = sources.entry(crate::briefstat::source_of(&row.kind).unwrap_or("briefings")).or_insert((0, 0, 0, 0.0));
                 slot.0 += 1;
                 slot.1 += messages;
@@ -598,7 +599,7 @@ pub fn compliance_report(store: &Store, scope: &str, repo_id: &str, since: f64) 
                     b_saved += as_int(payload, "tokens_saved");
                     b_reports += 1;
                     b_usd += usd;
-                    b_cost += payload.get("brief_cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+                    b_cost += worth.cost_usd;
                 }
             }
             _ => {}

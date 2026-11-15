@@ -1,0 +1,165 @@
+#!/bin/sh
+# Cork plugin launcher. Every hook in hooks/hooks.json runs through here:
+# it finds Cork's native program, cork, and hands it the event. The
+# build pinned in hooks.lock is the floor: it is downloaded the first time
+# (any file whose SHA-256 differs is refused) and placed in ~/.cork/bin,
+# where the program keeps itself current with Cork's signed releases, as a
+# machine install does. It fails open: a hook that cannot run says nothing
+# and never blocks the agent.
+#
+# A machine set up before the rename (Collide to Cork) keeps its ~/.collide
+# and its ~/.collide/bin/collide, for as long as no ~/.cork exists beside it:
+# the program picks the same folder. CORK_* settings are read first, then
+# the COLLIDE_* ones from before.
+#
+#   cork session-start | report | gate   (hook events, JSON on stdin)
+#   cork login [--server URL]            (connect this repo; opens a browser)
+#   cork status                          (what this repo is connected to)
+
+sub="$1"
+here="$(cd "$(dirname "$0")/.." && pwd)"
+root="${CLAUDE_PLUGIN_ROOT:-$here}"
+proj="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+base="${CORK_HOME:-${COLLIDE_HOME:-$HOME}}"
+if [ ! -e "$base/.cork" ] && [ -e "$base/.collide" ]; then
+  home="$base/.collide"; name=collide
+else
+  home="$base/.cork"; name=cork
+fi
+lock="$root/hooks.lock"
+server="${CORK_SERVER_URL:-${COLLIDE_SERVER_URL:-https://mcp.corkcli.com}}"
+# the repo's own config, under either name
+repo_cfg="$proj/.cork/config.json"
+[ -f "$repo_cfg" ] || [ ! -f "$proj/.collide/config.json" ] || repo_cfg="$proj/.collide/config.json"
+
+is_event() { case "$sub" in session-start|report|gate) return 0;; esac; return 1; }
+
+# A repo set up the classic way (the old per-repo setup) already runs these hooks from
+# its own .claude/settings.json, and a machine installed with the standalone
+# command runs them from ~/.claude/settings.json: two copies would report
+# every edit twice.
+if is_event && grep -qs 'collide-hook' "$proj/.claude/settings.json"; then
+  exit 0
+fi
+if is_event && grep -qsE '# (cork|collide)-machine' "$base/.claude/settings.json"; then
+  exit 0
+fi
+
+# the program: the one this plugin pinned (the free version's `cork`,
+# the hooks and the local server in one; published as `collide-<target>`),
+# kept per user, fetched once
+version=$(sed -n 's/^version //p' "$lock" 2>/dev/null | head -1)
+bin="$home/plugin-bin/v$version/$name"
+ext=""
+case "$(uname -s)" in
+  Darwin) os=apple-darwin;;
+  Linux) os=unknown-linux-gnu;;
+  MINGW*|MSYS*|CYGWIN*) os=pc-windows-msvc; ext=.exe;;
+  *) os="";;
+esac
+case "$(uname -m)" in
+  arm64|aarch64) arch=aarch64;;
+  x86_64|amd64) arch=x86_64;;
+  *) arch="";;
+esac
+bin="$bin$ext"
+
+# the pinned file: its lock line ("<target> <sha>"), the download, the digest check
+fetch() {
+  want=$(awk -v t="$arch-$os" '$1==t {print $2}' "$lock" 2>/dev/null | head -1)
+  [ -n "$version" ] && [ -n "$os" ] && [ -n "$arch" ] && [ -n "$want" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  mkdir -p "$(dirname "$bin")" || return 1
+  tmp="$bin.download.$$"
+  curl -fsSL --max-time 120 "$server/artifacts/free/v/$version/$arch-$os" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  got=$( (shasum -a 256 "$tmp" 2>/dev/null || sha256sum "$tmp" 2>/dev/null) | cut -d' ' -f1)
+  if [ -z "$got" ] || [ "$got" != "$want" ]; then rm -f "$tmp"; return 1; fi
+  chmod +x "$tmp" && mv "$tmp" "$bin"
+}
+
+# the program that runs: the managed copy in ~/.cork/bin (an old install's
+# ~/.collide/bin/collide), which updates itself (signed by Cork, digest
+# checked) like a machine install's
+managed="$home/bin/$name$ext"
+vnum() { "$1" --version 2>/dev/null | sed -n 's/.*hook artifacts v\([0-9][0-9]*\).*/\1/p' | head -1; }
+
+# the pinned build, downloaded once if it is not here yet
+pinned() {
+  [ -x "$bin" ] && return 0
+  fetch
+}
+
+# put the pinned build where it keeps itself current
+place() {
+  mkdir -p "$(dirname "$managed")" || return 1
+  cp "$bin" "$managed.new.$$" && chmod +x "$managed.new.$$" && mv -f "$managed.new.$$" "$managed"
+}
+
+run="$managed"
+if [ ! -x "$managed" ]; then
+  if pinned && place; then
+    run="$managed"
+  elif [ -x "$bin" ]; then
+    run="$bin"
+  else
+    if is_event; then
+      [ "$sub" = "session-start" ] && echo "Cork plugin: Cork could not be downloaded for this machine ($arch-$os), so it is off in this session. Tell the user; it retries next session."
+      exit 0
+    fi
+    echo "Cork: could not download Cork for $arch-$os from $server. Check your connection and try again." >&2
+    exit 1
+  fi
+elif [ "$sub" = "session-start" ] && [ -n "$version" ]; then
+  # once a session: never older than this plugin's pin
+  have=$(vnum "$managed")
+  if [ "${have:-0}" -lt "$version" ] 2>/dev/null && pinned; then
+    place || run="$bin"
+  fi
+fi
+
+# the free version: Cork for every repo on this machine, set up once.
+# The plugin brings the hooks, so nothing is written into
+# ~/.claude/settings.json.
+ensure_machine() {
+  [ -f "$home/machine.json" ] && return 0
+  "$run" install --no-settings >/dev/null 2>&1
+}
+
+case "$sub" in
+  session-start)
+    # a repo connected on its own keeps its connection; any other repo is
+    # covered by this machine's free version, set up here the first time
+    if [ ! -f "$repo_cfg" ] && ! ensure_machine; then
+      echo "Cork plugin: the free version could not be set up on this machine ($arch-$os), so Cork is off in this session. Tell the user; it retries next session."
+      exit 0
+    fi
+    # the session briefing, the first index of the tree, and (now and then)
+    # the program's own update
+    exec "$run" report
+    ;;
+  report|gate)
+    [ -f "$repo_cfg" ] || [ -f "$home/machine.json" ] || exit 0
+    exec "$run" "$sub"
+    ;;
+  login)
+    shift
+    exec "$run" login "$@"
+    ;;
+  status)
+    if [ ! -f "$repo_cfg" ]; then
+      exec "$run" status
+    fi
+    echo "Repository config ($repo_cfg):"
+    cat "$repo_cfg"
+    if [ -f "$home/credentials.json" ] && grep -qs "$(sed -n 's/.*"server_url": *"\([^"]*\)".*/\1/p' "$repo_cfg" | head -1)" "$home/credentials.json"; then
+      echo "Credential: present for that server."
+    else
+      echo "Credential: missing on this machine. Run /cork:login."
+    fi
+    "$run" --version
+    ;;
+  *)
+    echo "usage: cork <login|status>" >&2
+    exit 2
+    ;;
+esac

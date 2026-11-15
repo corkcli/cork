@@ -1,4 +1,4 @@
-//! Landing: the rebase-test-push loop, done by `collide-hook land` instead of
+//! Landing: the rebase-test-push loop, done by `cork land` instead of
 //! the model. Study 5's agents spent over half their tool calls getting work
 //! into origin: push, rejected, pull --rebase, rerun the tests, push, rejected
 //! again, each lap a message that replays the whole context. The hook runs
@@ -63,11 +63,13 @@ pub fn renames(store: &Store, scope: &str, now: f64) -> Map<String, Value> {
     let registry = store.kv_get("semlint", scope).unwrap_or_else(|| json!({}));
     let mut out = Map::new();
     if let Some(entries) = registry.get("renames").and_then(Value::as_object) {
-        for (old, info) in entries {
+        for (key, info) in entries {
+            // keyed `path::symbol` since v80; the symbol is on the entry
+            let old = { let symbol = text(info, "symbol"); if symbol.is_empty() { key.clone() } else { symbol } };
             let new = text(info, "new");
             let fresh = info.get("ts").and_then(Value::as_f64).unwrap_or(0.0) >= now - RENAME_TTL_S;
-            if fresh && !new.is_empty() && new != *old {
-                out.insert(old.clone(), json!(new));
+            if fresh && !new.is_empty() && new != old {
+                out.insert(old, json!(new));
             }
         }
     }
@@ -82,6 +84,15 @@ pub fn release(
 ) -> Value {
     let _ = store.kv_release_lease(LEASE_BUCKET, scope, holder);
     let outcome = text(body, "outcome");
+    // git's own trouble, as land met it: a rebase that conflicted, pushes
+    // that lost the race (the waste report's git baseline)
+    if outcome == "conflict" {
+        record_signal(store, scope, user, session, "merge_conflict", "land", 1, now);
+    }
+    let push_rejects = count(body, "push_rejects").min(20);
+    if push_rejects > 0 {
+        record_signal(store, scope, user, session, "push_rejected", "land", push_rejects, now);
+    }
     if outcome != "landed" {
         return json!({"ok": true, "released": true});
     }
@@ -100,8 +111,14 @@ pub fn release(
         "tests": text(body, "tests").chars().take(200).collect::<String>(),
         "tests_ok": body.get("tests_ok").cloned().unwrap_or(Value::Null),
         "seconds": body.get("seconds").and_then(Value::as_f64).unwrap_or(0.0),
+        "laps": laps_of(body),
+        "push_rejects": push_rejects,
     });
     let _ = store.ledger_append(scope, "landed", &row, now);
+    // the branch it landed onto moved: sessions on it elsewhere catch up
+    // at their next prompt (trunk.rs)
+    let target = { let target = text(body, "target"); if target.is_empty() { text(body, "branch") } else { target } };
+    crate::trunk::note_landed(store, scope, &target, row["commit"].as_str().unwrap_or(""), user, now);
     // it is on origin now: no longer in flight for anyone
     crate::inflight::landed(store, scope, user, session);
     // and whoever's copy is behind what just landed hears it on their next step
@@ -118,9 +135,134 @@ pub fn release(
     json!({"ok": true, "released": true, "recorded": true})
 }
 
+/// Each lap of a landing, as the hook timed it: how many commits it rebased
+/// over, the test command (no output, at most 120 characters), how long it
+/// ran, whether it passed, and how the push went. At most 20.
+fn laps_of(body: &Value) -> Vec<Value> {
+    body.get("laps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(20)
+        .map(|lap| {
+            let push = match text(lap, "push").as_str() {
+                p @ ("landed" | "rejected" | "failed") => p.to_string(),
+                _ => String::new(),
+            };
+            json!({
+                "incoming": count(lap, "incoming").min(10_000),
+                "test": text(lap, "test").chars().take(120).collect::<String>(),
+                "seconds": lap.get("seconds").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 7_200.0),
+                "ok": lap.get("ok").and_then(Value::as_bool),
+                "timed_out": lap.get("timed_out").and_then(Value::as_bool).unwrap_or(false),
+                "push": push,
+            })
+        })
+        .collect()
+}
+
+/// What git signals the hook may send.
+pub const SIGNALS: [&str; 3] = ["merge_conflict", "push_rejected", "revert"];
+
+#[allow(clippy::too_many_arguments)]
+fn record_signal(store: &Store, scope: &str, user: &str, session: &str, signal: &str, source: &str, n: u64, now: f64) {
+    let _ = store.ledger_append(scope, "git_signal", &json!({
+        "user": user, "session": session, "signal": signal, "source": source, "count": n,
+    }), now);
+}
+
+/// A git signal the hook saw in an agent's shell: a pull, rebase or merge
+/// that hit conflicts, a push rejected, a revert. A count, never the output.
+pub fn signal(store: &Store, scope: &str, user: &str, session: &str, body: &Value, now: f64) -> Value {
+    let kind = text(body, "signal");
+    if !SIGNALS.contains(&kind.as_str()) {
+        return json!({"ok": false, "reason": "signal is merge_conflict, push_rejected or revert"});
+    }
+    let source = if text(body, "source") == "land" { "land" } else { "shell" };
+    record_signal(store, scope, user, session, &kind, source, count(body, "count").clamp(1, 50), now);
+    json!({"ok": true})
+}
+
+pub const BASELINE_BUCKET: &str = "gitbaseline";
+const BASELINE_FIELDS: [&str; 3] = ["commits", "reverts", "conflict_fixes"];
+
+/// The repo's own history, week by week, as the hook counted it from `git
+/// log` on its machine: commits, reverts, and commits that say they fixed a
+/// merge or resolved a conflict. Counts only. Weeks are keyed by their
+/// Monday; machines with different history merge by the larger count.
+pub fn baseline(store: &Store, scope: &str, user: &str, body: &Value, now: f64) -> Value {
+    let Some(weeks) = body.get("weeks").and_then(Value::as_object) else {
+        return json!({"ok": false, "reason": "missing weeks"});
+    };
+    let mut record = store.kv_get(BASELINE_BUCKET, scope).unwrap_or_else(|| json!({"weeks": {}}));
+    let mut taken = 0;
+    for (monday, counts) in weeks.iter().take(60) {
+        let Ok(day) = chrono::NaiveDate::parse_from_str(monday, "%Y-%m-%d") else { continue };
+        if chrono::Datelike::weekday(&day) != chrono::Weekday::Mon {
+            continue;
+        }
+        let slot = &mut record["weeks"][monday.as_str()];
+        if !slot.is_object() {
+            *slot = json!({});
+        }
+        for field in BASELINE_FIELDS {
+            let given = count(counts, field).min(100_000);
+            let have = count(slot, field);
+            slot[field] = json!(given.max(have));
+        }
+        taken += 1;
+    }
+    // when Cork started recording here, kept: the ledger may be pruned
+    if let Some(first) = store.ledger_first_ts(scope) {
+        let kept = record.get("adopted_at").and_then(Value::as_f64).unwrap_or(f64::MAX);
+        record["adopted_at"] = json!(first.min(kept));
+    }
+    record["updated"] = json!(now);
+    record["by"] = json!(user);
+    let _ = store.kv_put(BASELINE_BUCKET, scope, &record, now);
+    json!({"ok": true, "weeks": taken})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_landing_keeps_each_laps_test_time_and_land_trouble_is_a_git_signal() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        release(&db, "w:r", "a@x", "1", "hook", "a@x#1", &json!({"outcome": "landed", "commit": "abc", "rebases": 2, "push_rejects": 1,
+            "laps": [{"incoming": 3, "test": "cargo test --release ".repeat(20), "seconds": 42.5, "ok": true, "push": "rejected", "output": "secret"},
+                     {"incoming": 1, "test": "cargo test", "seconds": 9999.0, "ok": false, "push": "bogus"}]}), 1_000.0, "test");
+        release(&db, "w:r", "a@x", "1", "hook", "a@x#1", &json!({"outcome": "conflict"}), 1_001.0, "test");
+        let rows = db.ledger_since("w:r", 0.0);
+        let landed = &rows.iter().find(|r| r.kind == "landed").unwrap().payload;
+        let laps = landed["laps"].as_array().unwrap();
+        assert_eq!(laps.len(), 2);
+        assert_eq!(laps[0]["test"].as_str().unwrap().chars().count(), 120);
+        assert_eq!(laps[0]["seconds"], 42.5);
+        assert!(laps[0].get("output").is_none(), "no output is ever kept");
+        assert_eq!(laps[1]["seconds"], 7_200.0);
+        assert_eq!(laps[1]["push"], "");
+        let signals: Vec<(String, String, u64)> = rows.iter().filter(|r| r.kind == "git_signal")
+            .map(|r| (text(&r.payload, "signal"), text(&r.payload, "source"), count(&r.payload, "count"))).collect();
+        assert_eq!(signals, vec![("push_rejected".into(), "land".into(), 1), ("merge_conflict".into(), "land".into(), 1)]);
+        assert_eq!(signal(&db, "w:r", "a@x", "1", &json!({"signal": "rm -rf"}), 1.0)["ok"], false);
+        assert_eq!(signal(&db, "w:r", "a@x", "1", &json!({"signal": "revert", "count": 999}), 1.0)["ok"], true);
+        assert_eq!(count(&db.ledger_since_kinds("w:r", 0.0, &["git_signal"]).pop().unwrap().payload, "count"), 50);
+    }
+
+    #[test]
+    fn a_baseline_keeps_counts_by_monday_and_the_larger_of_two_machines() {
+        let db = Store::open(std::path::Path::new(":memory:")).unwrap();
+        baseline(&db, "w:r", "a@x", &json!({"weeks": {"2026-09-07": {"commits": 40, "reverts": 2, "conflict_fixes": 1, "subject": "x"},
+            "2026-09-08": {"commits": 5}, "garbage": {"commits": 1}}}), 1.0);
+        let answer = baseline(&db, "w:r", "b@x", &json!({"weeks": {"2026-09-07": {"commits": 30, "reverts": 3}}}), 2.0);
+        assert_eq!(answer["weeks"], 1);
+        let record = db.kv_get(BASELINE_BUCKET, "w:r").unwrap();
+        let weeks = record["weeks"].as_object().unwrap();
+        assert_eq!(weeks.len(), 1, "a Tuesday and a non-date are dropped: {record}");
+        assert_eq!(weeks["2026-09-07"], json!({"commits": 40, "reverts": 3, "conflict_fixes": 1}));
+    }
 
     #[test]
     fn one_turn_at_a_time_and_a_dead_holder_expires() {
@@ -171,9 +313,11 @@ mod tests {
         db.kv_put("semlint", "w:r", &json!({"renames": {
             "amount_due": {"new": "checkout_total", "by": "a@x", "ts": 1_000_000.0},
             "old_one": {"new": "new_one", "by": "a@x", "ts": 1.0},
+            "shop/price.py::price": {"symbol": "price", "path": "shop/price.py", "new": "price_for", "by": "a@x", "ts": 1_000_000.0},
         }}), 1_000.0).unwrap();
         let got = renames(&db, "w:r", 1_000_100.0);
         assert_eq!(got.get("amount_due"), Some(&json!("checkout_total")));
         assert!(!got.contains_key("old_one"), "a week-old rename has had its chance");
+        assert_eq!(got.get("price"), Some(&json!("price_for")), "a v80 rule is keyed by file, renamed by symbol");
     }
 }

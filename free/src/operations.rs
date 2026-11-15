@@ -200,3 +200,44 @@ pub fn reverses(candidate: &Value, settled: &Value) -> bool {
         })
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod operations_ported_tests {
+    use super::*;
+
+    #[test]
+    fn the_set_is_closed_and_operands_are_checked() {
+        let ops = validate_operations(&json!([{"op": "rename", "symbol": "a", "new_name": "b"}])).unwrap();
+        assert_eq!(ops[0], json!({"op": "rename", "symbol": "a", "new_name": "b"}));
+        // refactor is gone: the "I don't know" bucket poisons everything
+        let err = validate_operations(&json!([{"op": "refactor", "symbol": "a"}])).unwrap_err();
+        assert!(err.contains("refactor"), "{err}");
+        let err = validate_operations(&json!([{"op": "add_param", "symbol": "a"}])).unwrap_err();
+        assert!(err.contains("requires"), "{err}");
+    }
+
+    #[test]
+    fn the_commutativity_table() {
+        let rename_a = json!({"op": "rename", "symbol": "a", "new_name": "a2"});
+        let addp_b = json!({"op": "add_param", "symbol": "b", "name": "x"});
+        let addp_a = json!({"op": "add_param", "symbol": "a", "name": "x"});
+        let extract_a = json!({"op": "extract", "symbol": "a", "new_name": "helper"});
+        assert_eq!(commutes(&rename_a, &addp_b), COMMUTE);
+        assert_eq!(commutes(&rename_a, &addp_a), CONFLICT);
+        // a rename onto a name someone else is adding
+        assert_eq!(commutes(&rename_a, &json!({"op": "add", "symbol": "a2"})), CONFLICT);
+        // extract's range semantics are not modelled: honest UNKNOWN
+        assert_eq!(commutes(&extract_a, &addp_a), UNKNOWN);
+        assert_eq!(commutes(&json!({"op": "refactor", "symbol": "a"}), &addp_a), UNKNOWN);
+    }
+
+    #[test]
+    fn modify_covers_body_edits() {
+        let ops = validate_operations(&json!([{"op": "modify", "symbol": "dispatch"}])).unwrap();
+        assert_eq!(ops[0], json!({"op": "modify", "symbol": "dispatch"}));
+        let same = json!({"op": "modify", "symbol": "dispatch"});
+        assert_eq!(commutes(&same, &json!({"op": "modify", "symbol": "dispatch"})), CONFLICT);
+        assert_eq!(commutes(&same, &json!({"op": "modify", "symbol": "elsewhere"})), COMMUTE);
+        assert_eq!(commutes(&same, &json!({"op": "rename", "symbol": "dispatch", "new_name": "x"})), CONFLICT);
+    }
+}

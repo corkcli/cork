@@ -4,7 +4,10 @@
 //! a push, ship it. The gate catches the commit (and `git add -A`,
 //! `git commit -a`) before it runs: when what it would take includes
 //! uncommitted work another live session in the SAME folder made, it is
-//! held, with the command that commits only this session's own files.
+//! held, with the command that commits only this session's own lines
+//! (`cork commit --mine`). In a file both sessions wrote, the write
+//! journal (journal.rs) tells their lines apart, so a `git add <file>` that
+//! would carry the other's hunks is held too.
 //!
 //! Each session's own files are what its hooks saw it write
 //! (`written_paths`) and what it staged or removed through git
@@ -50,7 +53,7 @@ fn toplevel(dir: &Path) -> Option<PathBuf> {
 }
 
 /// One simple command's words, quotes honoured (`-m 'a b'` is two words).
-fn words(segment: &str) -> Vec<String> {
+pub(crate) fn words(segment: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
@@ -270,6 +273,71 @@ fn would_take(command: &str, root: &Path) -> Option<BTreeSet<String>> {
     Some(take)
 }
 
+/// What a git command would put into a commit, line by line, for the
+/// journal's check: (paths whose staged content is taken, paths whose
+/// working-tree content is taken). `None` when it commits or stages nothing.
+fn hunk_scope(command: &str, cwd: &Path, root: &Path) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+    let mut staged: BTreeSet<String> = BTreeSet::new();
+    let mut work: BTreeSet<String> = BTreeSet::new();
+    let mut any = false;
+    for words in segments(command) {
+        let Some((sub, rest)) = git_call(&words) else { continue };
+        match sub.as_str() {
+            "commit" => {
+                any = true;
+                let named = commit_paths(&rest, cwd, root);
+                let all = rest.iter().any(|w| w == "--all" || (w.starts_with('-') && !w.starts_with("--") && w[1..].contains('a')));
+                if !named.is_empty() {
+                    work.extend(named);
+                } else {
+                    staged.extend(git_lines(root, &["diff", "--cached", "--name-only"]));
+                    if all {
+                        work.extend(git_lines(root, &["diff", "--name-only"]));
+                    }
+                }
+            }
+            "add" => {
+                any = true;
+                if rest.iter().any(|w| matches!(w.as_str(), "-A" | "--all" | "." | "-u" | "--update")) {
+                    work.extend(git_lines(root, &["diff", "--name-only"]));
+                    work.extend(git_lines(root, &["ls-files", "--others", "--exclude-standard"]));
+                } else {
+                    work.extend(named_paths(&rest, cwd, root));
+                }
+            }
+            _ => {}
+        }
+    }
+    staged.retain(|p| !work.contains(p));
+    any.then_some((staged, work))
+}
+
+/// The paths a `git commit` names (`git commit -m x -- a b`, `git commit a`).
+fn commit_paths(rest: &[String], cwd: &Path, root: &Path) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    let mut flags_done = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let w = rest[i].as_str();
+        if flags_done || !w.starts_with('-') || w == "-" {
+            if w != "-" {
+                named.push(w.to_string());
+            }
+        } else if w == "--" {
+            flags_done = true;
+        } else if let Some(long) = w.strip_prefix("--") {
+            let takes = ["message", "file", "author", "date", "reuse-message", "reedit-message", "fixup", "squash", "template", "cleanup", "trailer"];
+            if !long.contains('=') && takes.contains(&long) {
+                i += 1;
+            }
+        } else if w[1..].ends_with(['m', 'F', 'C', 'c', 't']) {
+            i += 1;
+        }
+        i += 1;
+    }
+    named_paths(&named, cwd, root)
+}
+
 fn ago(seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     if s < 90 { "just now".into() } else if s < 5400 { format!("{}m ago", s / 60) } else { format!("{}h ago", s / 3600) }
@@ -277,7 +345,7 @@ fn ago(seconds: f64) -> String {
 
 /// The gate's check for a Bash command: `Some(reason)` holds it.
 pub fn commit_guard(stdin_data: &str, env: &Env) -> Option<String> {
-    if config::get(env, "COLLIDE_SHARED_TREE") == "0" {
+    if config::get(env, "CORK_SHARED_TREE") == "0" {
         return None;
     }
     let input: Value = serde_json::from_str(stdin_data).ok()?;
@@ -286,7 +354,7 @@ pub fn commit_guard(stdin_data: &str, env: &Env) -> Option<String> {
     }
     let command = input.get("tool_input").map(|i| text(i, "command")).unwrap_or_default();
     // the user said to commit them together: the agent puts this in front
-    if command.contains("COLLIDE_SHARED_TREE=0") {
+    if config::sets(&command, "CORK_SHARED_TREE=0") {
         return None;
     }
     static GIT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -301,7 +369,8 @@ pub fn commit_guard(stdin_data: &str, env: &Env) -> Option<String> {
     if others.is_empty() {
         return None;
     }
-    let take = would_take(&command, &root)?;
+    let commit = crate::journal::commit_hint(env);
+    let take = would_take(&command, &root).unwrap_or_default();
     let mine = paths_of(&config::load_json(&crate::check::state_path(&session, env)));
     let mut theirs: Vec<(String, f64, Vec<String>)> = Vec::new();
     for other in &others {
@@ -311,7 +380,24 @@ pub fn commit_guard(stdin_data: &str, env: &Env) -> Option<String> {
         }
     }
     if theirs.is_empty() {
-        return None;
+        // files both sessions wrote: the journal says whose lines are whose
+        let (staged, work) = hunk_scope(&command, &cwd, &root)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let staged: Vec<String> = staged.into_iter().collect();
+        let work: Vec<String> = work.into_iter().collect();
+        let mut found = crate::journal::foreign(&root, &staged, true, &session, env, deadline);
+        found.extend(crate::journal::foreign(&root, &work, false, &session, env, deadline));
+        if found.is_empty() {
+            return None;
+        }
+        let lines: Vec<String> = found.iter().take(NAMED).map(|(path, who)| format!("{path}: lines {} wrote", who.join(", "))).collect();
+        return Some(format!(
+            "Cork held this command: it would commit lines another session in this folder ({}) wrote and has not committed:\n  {}\n\
+Commit only your own lines instead: {commit} -m \"...\" (add --dry-run to see the split). \
+Leave their lines as they are. If the user wants them committed together, run the command with CORK_SHARED_TREE=0 in front.",
+            root.display(),
+            lines.join("\n  "),
+        ));
     }
     let foreign: BTreeSet<&String> = theirs.iter().flat_map(|(_, _, h)| h.iter()).collect();
     let own: Vec<&String> = take.iter().filter(|p| !foreign.contains(p)).collect();
@@ -328,26 +414,17 @@ pub fn commit_guard(stdin_data: &str, env: &Env) -> Option<String> {
     let instead = if own.is_empty() {
         "Nothing staged here is yours: do not commit for them.".to_string()
     } else {
-        let list: Vec<String> = own.iter().map(|p| shell_word(p)).collect();
-        format!("Commit only your own files instead: git commit -m \"...\" -- {}", list.join(" "))
+        format!("Commit only what you wrote instead: {commit} -m \"...\"")
     };
     Some(format!(
-        "Collide held this command: another Claude session working in this same folder ({}) has uncommitted work it would sweep in:\n  {}\n\
+        "Cork held this command: another Claude session working in this same folder ({}) has uncommitted work it would sweep in:\n  {}\n\
 That work is theirs, half done or not; committing it ships it under your commit. {instead}\n\
 Leave their changes staged and untouched (never unstage, restore or stash them). \
 Tell the user in one line which session's files you left out. If the user wants them committed together, \
-they will say so; then run the command with COLLIDE_SHARED_TREE=0 in front.",
+they will say so; then run the command with CORK_SHARED_TREE=0 in front.",
         root.display(),
         who.join("\n  "),
     ))
-}
-
-fn shell_word(path: &str) -> String {
-    if path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) {
-        path.to_string()
-    } else {
-        format!("'{}'", path.replace('\'', "'\\''"))
-    }
 }
 
 #[cfg(test)]
@@ -371,7 +448,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let mut env = Env::new();
         env.insert("HOME".into(), base.to_string_lossy().to_string());
-        std::fs::create_dir_all(base.join(".collide").join("check")).unwrap();
+        std::fs::create_dir_all(crate::config::data_dir(&env).join("check")).unwrap();
         sh(&repo, &["init", "-q", "-b", "main"]);
         sh(&repo, &["config", "user.email", "t@t"]);
         sh(&repo, &["config", "user.name", "t"]);
@@ -395,12 +472,12 @@ mod tests {
         let held = commit_guard(&input("bbbbbbbb-2", &repo, "git commit -m 'Ship it' && git push"), &env).unwrap();
         assert!(held.contains("session aaaaaaaa"), "{held}");
         assert!(held.contains("old_view.js"));
-        assert!(held.contains("git commit -m \"...\" -- mine.js"), "{held}");
+        assert!(held.contains("commit --mine -m \"...\""), "{held}");
         // committing only its own paths is fine, and so is A's own commit
         assert!(commit_guard(&input("bbbbbbbb-2", &repo, "git commit -m x -- mine.js"), &env).is_none());
         assert!(commit_guard(&input("aaaaaaaa-1", &repo, "git commit -m 'Remove the old view' -- old_view.js"), &env).is_none());
         // and the user can say so
-        assert!(commit_guard(&input("bbbbbbbb-2", &repo, "COLLIDE_SHARED_TREE=0 git commit -m x"), &env).is_none());
+        assert!(commit_guard(&input("bbbbbbbb-2", &repo, "CORK_SHARED_TREE=0 git commit -m x"), &env).is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 

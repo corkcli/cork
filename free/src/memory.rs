@@ -179,7 +179,7 @@ pub struct SaveInput<'a> {
 }
 
 
-/// Write one anchored note. Returns the Python response shape.
+/// Write one anchored note. Returns the tool's response.
 pub fn save(store: &Store, input: &SaveInput) -> Value {
     let fact: String = input.fact.trim().chars().take(MAX_FACT).collect();
     if fact.is_empty() {
@@ -300,7 +300,7 @@ pub fn confidence(memory: &Value, rewrites: i64, conflicted: bool, history: &[f6
 /// how many verified test runs passed, how many failed, and how many times
 /// a second person came back to the file within half an hour of someone
 /// else's edit. Read from the ledger since the note, at most 30 days back.
-/// A note anchored to nothing has no outcomes. Python's `_memory_outcomes`.
+/// A note anchored to nothing has no outcomes.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Outcomes {
     pub passes: i64,
@@ -532,6 +532,19 @@ pub fn annotate(store: &Store, scope: &str, memories: &[Value]) -> Vec<Value> {
 
     for memory in memories {
         let mut view = memory.clone();
+        // an owner's standing decision does not age: it is about the code's
+        // future, so the code moving under it is what it is meant to meet.
+        // Never stale, never scored down by outcomes; it lives until withdrawn
+        if crate::decisions::is_decision(memory) {
+            if let Some(map) = view.as_object_mut() {
+                map.insert("stale".into(), json!(false));
+                map.insert("rewrites".into(), json!(0));
+                let live = crate::decisions::is_live(memory);
+                map.insert("confidence".into(), json!(if live { 0.95 } else { 0.1 }));
+            }
+            out.push(view);
+            continue;
+        }
         let Some(anchor_value) = memory.get("anchor").filter(|a| !a.is_null()).cloned() else {
             out.push(view);
             continue;
@@ -578,8 +591,7 @@ pub fn annotate(store: &Store, scope: &str, memories: &[Value]) -> Vec<Value> {
             .unwrap_or_default();
         // compared as the hash each was written against, not as raw JSON:
         // an absent field and an explicit null are the same fact — "the
-        // anchor did not exist when this was written" — and Python's dict
-        // lookup returns None for both
+        // anchor did not exist when this was written"
         fn hash_of(note: &Value) -> Option<&str> {
             note.get("anchor_hash").and_then(Value::as_str)
         }
@@ -987,27 +999,32 @@ pub fn locality_memories(
 
     let mut hits: Vec<Value> = Vec::new();
     for (_key, memory) in store.kv_list("memory", &format!("{scope}:")) {
-        let Some(anchor) = memory.get("anchor").filter(|a| !a.is_null()) else { continue };
-        if crate::compat::truthy(memory.get("superseded_by")) {
+        if memory.get("anchor").filter(|a| !a.is_null()).is_none() {
             continue;
         }
-        let kind = anchor.get("kind").and_then(Value::as_str).unwrap_or("");
-        let anchor_path = anchor.get("path").and_then(Value::as_str).unwrap_or("");
-        let anchor_symbol = anchor.get("symbol").and_then(Value::as_str).unwrap_or("");
-        let matched = match kind {
-            "symbol" => {
-                touched_paths.contains(anchor_path) || touched_symbols.contains(anchor_symbol)
+        if crate::compat::truthy(memory.get("superseded_by")) || crate::compat::truthy(memory.get("withdrawn")) {
+            continue;
+        }
+        // a standing decision may cover several anchors
+        let matched = crate::decisions::anchors_of(&memory).iter().any(|anchor| {
+            let kind = anchor.get("kind").and_then(Value::as_str).unwrap_or("");
+            let anchor_path = anchor.get("path").and_then(Value::as_str).unwrap_or("");
+            let anchor_symbol = anchor.get("symbol").and_then(Value::as_str).unwrap_or("");
+            match kind {
+                "symbol" => {
+                    touched_paths.contains(anchor_path) || touched_symbols.contains(anchor_symbol)
+                }
+                "file" => touched_paths.contains(anchor_path),
+                // a directory anchor covers every path beneath it; the empty path
+                // is the repo root and covers everything
+                _ => {
+                    anchor_path.is_empty()
+                        || touched_paths.iter().any(|path| {
+                            path == anchor_path || path.starts_with(&format!("{anchor_path}/"))
+                        })
+                }
             }
-            "file" => touched_paths.contains(anchor_path),
-            // a directory anchor covers every path beneath it; the empty path
-            // is the repo root and covers everything
-            _ => {
-                anchor_path.is_empty()
-                    || touched_paths.iter().any(|path| {
-                        path == anchor_path || path.starts_with(&format!("{anchor_path}/"))
-                    })
-            }
-        };
+        });
         if matched {
             hits.push(memory);
         }
@@ -1181,4 +1198,50 @@ pub fn get_symbol(store: &Store, scope: &str, path: &str, symbol: &str) -> Value
         }
     }
     found
+}
+
+#[cfg(test)]
+mod recall_ported_tests {
+    use super::*;
+
+    fn store_with(scopes: &[&str], owner: &str) -> Store {
+        let store = Store::open(std::path::Path::new(":memory:")).expect("in-memory store");
+        for scope in scopes {
+            store.put_tree(scope, "someone", &json!({"root": "r", "dirs": {}, "files": {}}), 1.0).unwrap();
+        }
+        store.kv_put("member", &format!("ws1/{owner}"), &json!({"uid": owner, "role": "owner", "access": "write"}), 0.0).unwrap();
+        store
+    }
+
+    fn note(store: &Store, key: &str, id: &str, fact: &str, created: f64) {
+        store.kv_put("memory", key, &json!({"id": id, "fact": fact, "created": created, "tags": []}), 0.0).unwrap();
+    }
+
+    fn ids(found: &Value) -> Vec<String> {
+        found["memories"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap_or("").to_string()).collect()
+    }
+
+    #[test]
+    fn recall_finds_notes_across_the_whole_workspace_and_never_another() {
+        let store = store_with(&["ws1:collide", "ws1:github.com/lithometric/agentmemory", "ws2:other"], "uid1");
+        note(&store, "ws1:collide:m1", "m1", "include the new collide logo for the mcp icons", 300.0);
+        note(&store, "ws1:github.com/lithometric/agentmemory:m2", "m2", "older rationale note", 200.0);
+        note(&store, "ws2:other:m3", "m3", "should not appear", 999.0);
+        let found = recall(&store, "ws1", "uid1", "kevin@x", "ws1:github.com/lithometric/cork", "", &[], 10, 0.0, true);
+        let ids = ids(&found);
+        assert!(ids.contains(&"m1".to_string()) && ids.contains(&"m2".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"m3".to_string()));
+        assert_eq!(ids[0], "m1", "newest first");
+    }
+
+    #[test]
+    fn recall_ranks_the_queried_repo_first_then_the_rest() {
+        let store = store_with(&["ws1:github.com/lithometric/cork", "ws1:shop.example"], "u");
+        note(&store, "ws1:github.com/lithometric/cork:own", "own", "this repo's note", 100.0);
+        note(&store, "ws1:shop.example:sib", "sib", "sibling repo note", 500.0);
+        let found = recall(&store, "ws1", "u", "k", "ws1:github.com/lithometric/cork", "", &[], 1, 0.0, true);
+        // limit 1 keeps the queried repo's own note, not the newer sibling
+        assert_eq!(ids(&found), vec!["own".to_string()]);
+        assert_eq!(found["total_matched"], 2);
+    }
 }

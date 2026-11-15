@@ -319,6 +319,10 @@ pub fn gate_check(
     let row = json!({"sequence": dir, "number": next, "formatted": formatted_next, "title": "",
                      "user": user, "agent": agent, "auto": true, "instead_of": number});
     let _ = store.ledger_append(scope, "claim_made", &row, stamp);
+    // what the agent writes next settles it: the number it was moved to, or
+    // the one it was moved off (outcomes.rs)
+    crate::outcomes::open(store, scope, "number_claim", user, session,
+        &[path.to_string(), format!("{dir}{formatted_next}{rest}")], json!({}), stamp);
     // the clash that did not happen, on the savings page beside traffic control
     crate::briefstat::record_saving(
         store, scope, "claim_prevented", user, agent, session, CLASH_MESSAGES,

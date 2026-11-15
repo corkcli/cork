@@ -129,6 +129,83 @@ fn triples(value: Option<&Value>) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
+/// The content hash the protocol bases a write on (SPEC.md §16, "Content
+/// hashes"): SHA-256 hex of the text with `\r\n` turned into `\n` and the
+/// trailing whitespace of every line stripped, so a line-ending or an
+/// editor's trailing spaces never read as a change. Every hook and server
+/// that names a symbol's content by hash uses this one function.
+pub fn symbol_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(normalized(text).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn normalized(text: &str) -> String {
+    let text = text.replace("\r\n", "\n");
+    text.split('\n').map(str::trim_end).collect::<Vec<_>>().join("\n")
+}
+
+/// `symbol_hash` with the symbol's own name blanked where it is declared:
+/// the same before and after a pure rename, which is how a rename is told
+/// from a delete and an insert.
+pub fn shape_hash(text: &str, name: &str) -> String {
+    let bare = bare_name(name);
+    let text = normalized(text);
+    let blanked = if bare.is_empty() { text } else { text.replacen(bare, "\u{0}", 1) };
+    symbol_hash(&blanked)
+}
+
+/// The last segment of a qualified name: `Config.load` → `load`,
+/// `impl Foo` → `Foo`.
+pub fn bare_name(name: &str) -> &str {
+    name.rsplit([' ', '.', ':']).next().unwrap_or(name)
+}
+
+/// One declaration as the protocol sees it: where it is and what its
+/// content hashes to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalSymbol {
+    pub name: String,
+    pub signature: String,
+    /// 1-based first and last line, decorators included.
+    pub span: (u32, u32),
+    /// `symbol_hash` of the lines in `span`.
+    pub hash: String,
+    /// `shape_hash` of the same lines.
+    pub shape: String,
+}
+
+/// The declarations of a file, for keying protocol ops. `None` when no
+/// parser knows the file (it is keyed as a whole file); `clean: false`
+/// when the parse hit a syntax error, so its symbols cannot be trusted.
+pub struct LocalParse {
+    pub clean: bool,
+    pub symbols: Vec<LocalSymbol>,
+}
+
+pub fn symbols(path: &str, content: &str) -> Option<LocalParse> {
+    let parsed = crate::engine::parse(path, content)?;
+    let lines: Vec<&str> = content.split('\n').collect();
+    let symbols = parsed
+        .symbols
+        .iter()
+        .map(|s| {
+            let from = (s.span.0.max(1) as usize - 1).min(lines.len());
+            let to = (s.span.1 as usize).clamp(from, lines.len());
+            let text = lines[from..to].join("\n");
+            LocalSymbol {
+                name: s.name.clone(),
+                signature: s.signature.clone(),
+                span: s.span,
+                hash: symbol_hash(&text),
+                shape: shape_hash(&text, &s.name),
+            }
+        })
+        .collect();
+    Some(LocalParse { clean: parsed.status == "clean", symbols })
+}
+
 /// The server's side: the structure a hook sent, as the parse the server
 /// would have made. The language comes from the path (a client cannot name
 /// one the server does not know) and the status must be one the parser
@@ -224,6 +301,36 @@ mod tests {
         forged["status"] = json!("whatever");
         assert!(from_structure("pkg/tax.py", &forged).is_none());
         assert!(from_structure("notes.xyz", &sent["structure"]).is_none());
+    }
+
+    #[test]
+    fn the_content_hash_ignores_line_endings_and_trailing_space_only() {
+        let h = symbol_hash("def f():\n    return 1\n");
+        assert_eq!(h, symbol_hash("def f():  \r\n    return 1\t\r\n"));
+        assert_ne!(h, symbol_hash("def f():\n    return 2\n"));
+        assert_ne!(h, symbol_hash("def f():\n  return 1\n"), "leading space is code");
+        // pinned: another implementation must hash exactly this way
+        assert_eq!(symbol_hash("a \r\nb"), "7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78");
+    }
+
+    #[test]
+    fn a_rename_keeps_the_shape_and_a_body_edit_does_not() {
+        let renamed = SRC.replace("def compute_tax(", "def tax_of(");
+        let before = symbols("pkg/tax.py", SRC).unwrap();
+        let after = symbols("pkg/tax.py", &renamed).unwrap();
+        assert!(before.clean && after.clean);
+        let (b, a) = (&before.symbols[0], &after.symbols[0]);
+        assert_eq!((b.name.as_str(), a.name.as_str()), ("compute_tax", "tax_of"));
+        assert_ne!(b.hash, a.hash);
+        assert_eq!(b.shape, a.shape);
+        let edited = symbols("pkg/tax.py", &SRC.replace("rate, 2)", "rate, 4)")).unwrap();
+        assert_ne!(edited.symbols[0].shape, b.shape);
+        assert_eq!(edited.symbols[1].hash, before.symbols[1].hash, "the other symbol is untouched");
+        assert_eq!(b.span, (4, 6));
+        assert!(symbols("notes.txt", "x").is_none());
+        assert!(!symbols("a.py", "def (:\n").unwrap().clean);
+        assert_eq!(bare_name("Config.load"), "load");
+        assert_eq!(bare_name("impl Foo"), "Foo");
     }
 
     #[test]

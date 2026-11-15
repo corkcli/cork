@@ -28,7 +28,7 @@
 //! its first caller.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
 use serde_json::{json, Value};
@@ -38,14 +38,12 @@ use crate::compat::{new_id, python_repr, truthy};
 use crate::repo::repo_key;
 use crate::store::{now, Store};
 
-/// Unambiguous, human-typable invite alphabet — no 0/O/1/I/L — matching
-/// Python's `INVITE_ALPHABET`.
+/// Unambiguous, human-typable invite alphabet — no 0/O/1/I/L.
 const INVITE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const INVITE_TTL_S: f64 = 7.0 * 86400.0;
 const INVITE_MAX_USES: i64 = 20;
 
-/// An 8-character invite code drawn from OS randomness, matching Python's
-/// `secrets.choice`.
+/// An 8-character invite code drawn from OS randomness.
 ///
 /// Rejection sampling, not a plain modulo: 256 is not a multiple of the
 /// alphabet's 31 characters, so `byte % 31` would hand out the first eight
@@ -94,8 +92,8 @@ impl Principal {
     }
 }
 
-/// Which repos a member (or invite) may work in — Python's `list[str] | str`
-/// union, made concrete so a caller cannot pass a stray string other than
+/// Which repos a member (or invite) may work in — `"*"` or a list, made
+/// concrete so a caller cannot pass a stray string other than
 /// `"*"`.
 #[derive(Debug, Clone)]
 pub enum RepoScope {
@@ -103,8 +101,7 @@ pub enum RepoScope {
     Some(Vec<String>),
 }
 
-/// Optional arguments to [`create_invite`], mirroring the keyword arguments
-/// `app.py` builds up conditionally before calling the Python method.
+/// Optional arguments to [`create_invite`].
 pub struct InviteOptions {
     pub ttl_s: f64,
     pub max_uses: i64,
@@ -114,8 +111,8 @@ pub struct InviteOptions {
 }
 
 /// A seat-limit lookup: workspace id -> the cap, or `None` for unlimited.
-/// Billing isn't ported yet, so [`redeem_invite`] takes this as an optional
-/// callback rather than calling into a `billing` module directly.
+/// [`redeem_invite`] takes this as an optional callback rather than calling
+/// into `billing` directly.
 ///
 /// Carries its own lifetime rather than defaulting to `'static`: a bare
 /// `dyn Fn(&str) -> Option<i64>` alias with no lifetime parameter gets
@@ -151,13 +148,13 @@ fn int_or(value: &Value, key: &str, default: i64) -> i64 {
     value.get(key).and_then(Value::as_i64).unwrap_or(default)
 }
 
-/// Python's `s[:n]` counts Unicode code points, not bytes; `&str[..n]` would
+/// The first `max` Unicode code points, not bytes; `&str[..n]` would
 /// panic mid-codepoint on anything outside ASCII.
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Parse the `"*" | [repo, ...]` union Python stores for a `repos` field.
+/// Parse the `"*" | [repo, ...]` union stored for a `repos` field.
 /// Anything that isn't a JSON array — `"*"`, missing, or null — reads as
 /// every repo, matching every default this module ever wrote (`.get(k, "*")`).
 fn repo_scope_of(value: Option<&Value>) -> RepoScope {
@@ -246,6 +243,69 @@ pub fn create(
     Ok(ws)
 }
 
+/// `personal_ws` `<uid>` -> `{workspace, at}`: the account was given its
+/// personal workspace (or `{closed: true}`: the account was deleted). Either
+/// way it is never given another, so a workspace removed later, or a stale
+/// token's call after the account is gone, never brings one back.
+pub const PERSONAL_MADE_BUCKET: &str = "personal_ws";
+
+/// The name an account's own workspace gets: its first name ("Alice's
+/// workspace"), else its username, else the email's local part.
+pub fn personal_name_for(principal: &Principal, profile: &Value) -> String {
+    let first_word = |s: &str| s.split_whitespace().next().unwrap_or("").to_string();
+    let local_part = |s: &str| s.split('@').next().unwrap_or("").to_string();
+    let who = [
+        first_word(&text(profile, "name")),
+        first_word(&principal.name),
+        text(profile, "username"),
+        text(profile, "github_login"),
+        local_part(&principal.email),
+    ]
+    .into_iter()
+    .map(|s| truncate_chars(s.trim(), 60))
+    // a test or provider principal can carry its uid as its "name": not a name
+    .find(|s| !s.is_empty() && s != &principal.uid);
+    match who {
+        Some(who) => format!("{who}'s workspace"),
+        None => "My workspace".to_string(),
+    }
+}
+
+/// Every account gets a workspace of its own the first time it signs in, so
+/// a new person lands somewhere their agents can report to before they
+/// have named anything. Made once, and only for an account in no workspace
+/// at all: one invited first already has a place, and one that ever had a
+/// personal workspace (or was deleted) never gets a second. It is the Free
+/// plan's one workspace, so it can never put an account over that cap.
+/// Returns the workspace when this call made it.
+pub fn ensure_personal(store: &Store, principal: &Principal, profile: &Value) -> Option<Value> {
+    let settled = || {
+        principal.uid.is_empty()
+            || store.kv_get(PERSONAL_MADE_BUCKET, &principal.uid).is_some()
+            || !list_for(store, &principal.uid).is_empty()
+    };
+    // every workspace list asks: the answer is almost always "settled",
+    // and that needs no lock
+    if settled() {
+        return None;
+    }
+    // two first loads at once (the navbar and the page) must not make two
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if settled() {
+        return None;
+    }
+    let name = personal_name_for(principal, profile);
+    // the name is the account's first, so it cannot be taken; the
+    // personal-kind check in create still refuses a second outright
+    let ws = create(store, principal, &name, "personal", "").ok()?;
+    let _ = store.kv_put(PERSONAL_MADE_BUCKET, &principal.uid, &json!({"workspace": text(&ws, "id"), "at": now()}), now());
+    // (the first month's bonus hours land when the account's first agent
+    // reports: main::first_agent_bonus)
+    crate::analytics::capture(&principal.uid, "personal_workspace_created", &text(&ws, "id"), json!({}));
+    Some(ws)
+}
+
 pub fn owned_by(store: &Store, uid: &str) -> Vec<Value> {
     list_for(store, uid).into_iter().filter(|w| text(w, "owner") == uid).collect()
 }
@@ -318,6 +378,16 @@ pub fn list_for(store: &Store, uid: &str) -> Vec<Value> {
         .kv_list("uws", &format!("{uid}/"))
         .into_iter()
         .filter_map(|(_, entry)| get(store, &text(&entry, "workspace")))
+        .map(|mut workspace| {
+            // its uploaded icon's version: the dashboard fetches the picture
+            // (`/api/workspaces/:id/icon`) only when there is one, and again
+            // when it changes. Icons live in object storage: the cloud's alone
+            #[cfg(feature = "cloud")]
+            if let Some(version) = crate::repoicons::workspace_version(store, &text(&workspace, "id")) {
+                workspace["icon_v"] = Value::String(version);
+            }
+            workspace
+        })
         .collect();
     out.sort_by(|a, b| num(a, "created").partial_cmp(&num(b, "created")).unwrap());
     out
@@ -341,7 +411,7 @@ pub fn members(store: &Store, workspace_id: &str) -> Vec<Value> {
     out
 }
 
-fn add_member(
+pub(crate) fn add_member(
     store: &Store, workspace_id: &str, principal: &Principal, role: &str, added_by: &str, now_ts: f64,
 ) -> Value {
     let record = json!({
@@ -453,7 +523,7 @@ pub fn create_invite(store: &Store, workspace_id: &str, principal: &Principal, o
 /// today). The invite's repos are granted one by one — a repo already at its
 /// cap is skipped, and when none can be granted the join bounces with
 /// `seats_full`. Existing members always get through; re-redeeming widens
-/// their repo list. Twin of Python's `WorkspaceStore.redeem_invite`.
+/// their repo list.
 pub fn redeem_invite(
     store: &Store,
     code: &str,
@@ -479,20 +549,14 @@ pub fn redeem_invite(
     let wanted = repo_scope_of(invite.get("repos"));
     let existing = member(store, &ws_id, &principal.uid);
 
-    let mut plan = crate::billing::plan_of(store, &ws_id);
+    let plan = crate::billing::plan_of(store, &ws_id);
     let mut viewer = false;
-    let mut share_play = false;
     if existing.is_none() && !crate::billing::is_active_status(plan.get("status")) {
-        let stored = store.kv_get(crate::billing::BILLING_BUCKET, &ws_id);
-        let trial_spent = stored.as_ref().is_some_and(|record| truthy(record.get("trial_used")));
-        if !trial_spent && text(&invite, "created_by") == text(&ws, "owner") {
-            // SHARE PLAY: the owner's first invite — both get 14 days of Team
-            plan = crate::billing::start_trial(store, &ws_id, crate::billing::TRIAL_DAYS, "invite");
-            share_play = true;
-        } else {
-            // Free, trial spent: viewers are free and unlimited
-            viewer = true;
-        }
+        // Free: viewers are free and unlimited. (Share Play, which put the
+        // workspace on 14 unmetered days of Team at the owner's first
+        // invite, is gone: the inviter gets bonus agent hours instead,
+        // below, once the invitee is in.)
+        viewer = true;
     }
 
     if existing.is_none() && !viewer {
@@ -542,7 +606,7 @@ owner can add seats on the billing page",
                         "ok": false, "seats_full": true, "repos_full": skipped,
                         "error": format!(
                             "every repo on this invite already has {limit} people on it (the free \
-plan's limit per repo) — the owner can upgrade on the billing page or free a seat"
+plan's limit per repo) — the owner can add units on the billing page, or make room on a repo"
                         ),
                     });
                 }
@@ -571,7 +635,7 @@ plan's limit per repo) — the owner can upgrade on the billing page or free a s
                         "ok": false, "seats_full": true, "repos_full": skipped,
                         "error": format!(
                             "every repo in this workspace already has {limit} people on it (the \
-free plan's limit per repo) — the owner can upgrade on the billing page or free a seat"
+free plan's limit per repo) — the owner can add units on the billing page, or make room on a repo"
                         ),
                     });
                 }
@@ -617,20 +681,22 @@ free plan's limit per repo) — the owner can upgrade on the billing page or fre
     if access == "read" {
         result["viewer"] = json!(true);
     }
-    if share_play {
-        result["share_play"] = json!({
-            "trial_ends": plan.get("trial_ends").cloned().unwrap_or(Value::Null),
-            "days": crate::billing::TRIAL_DAYS,
-        });
-    }
     if !skipped.is_empty() {
         result["repos_full"] = json!(skipped);
     }
     if newly_joined {
+        // the inviter's bonus hours, once per account: a teammate they
+        // brought in joined
+        let inviter = text(&invite, "created_by");
+        if !inviter.is_empty() && inviter != principal.uid
+            && crate::billing::grant_bonus(store, &ws_id, &inviter, "invite", crate::billing::INVITE_BONUS_HOURS)
+        {
+            result["inviter_bonus_hours"] = json!(crate::billing::INVITE_BONUS_HOURS);
+        }
         crate::analytics::signed_up(store, &principal.uid, &principal.email, &principal.name, "invite");
         crate::analytics::capture(
             &principal.uid, "invite_joined", &ws_id,
-            json!({"access": access, "share_play": share_play, "invited_by": text(&invite, "created_by")}),
+            json!({"access": access, "invited_by": inviter}),
         );
     }
     result
@@ -712,9 +778,8 @@ pub fn blocked_joins(store: &Store, workspace_id: &str, within_s: f64) -> Vec<Va
 /// after a reload. A repo moved to another workspace is hidden here even
 /// though its pre-move history stays under the old scope.
 ///
-/// `include_live_intents` mirrors Python's `storage` parameter: `app.py`
-/// always passes a live storage handle (`true`); `redeem_invite`'s seat count
-/// passes `None` (`false`) — a repo known only through an uncommitted intent
+/// `include_live_intents`: the routes pass `true`; `redeem_invite`'s seat
+/// count passes `false` — a repo known only through an uncommitted intent
 /// has no proof any seat is actually used on it yet.
 pub fn repos(store: &Store, workspace_id: &str, include_live_intents: bool) -> Vec<String> {
     let prefix = format!("{workspace_id}:");
@@ -748,4 +813,427 @@ pub fn repos(store: &Store, workspace_id: &str, include_live_intents: bool) -> V
         .map(|(_, rec)| repo_key(&text(&rec, "repo_id")))
         .collect();
     found.into_iter().filter(|r| !moved.contains(&repo_key(r))).collect()
+}
+
+/// Everything one workspace keeps, found by the id every row of it carries
+/// (one sweep for an admin's deletion and an owner's):
+/// its record, members and their index rows, invites, billing, settings and
+/// integrations (keys that name the workspace); each repo's scope
+/// (`<ws>:<repo>`: the map, notes, messages and inboxes, files and trees);
+/// its ephemeral markers; and the credentials bound to it. A credential that
+/// only lists the workspace among others keeps the others. A row that names
+/// the workspace only in its value goes when it points at it (`workspace` or
+/// `workspace_id` is the id) and is otherwise left, and counted.
+///
+/// The ledger stays: its rows carry no message text or code, and it is one
+/// hash chain across every workspace, so deleting a row would break the
+/// proof for all of them. Counts what is there; with `dry_run` false,
+/// deletes it.
+pub fn delete_workspace(store: &Store, workspace_id: &str, dry_run: bool) -> Value {
+    let ws = workspace_id.trim();
+    let Some(workspace) = get(store, ws) else {
+        return json!({"ok": false, "error": "no such workspace"});
+    };
+    // the id is the needle: a short one would match other workspaces' rows
+    if ws.len() < 8 {
+        return json!({"ok": false, "error": "that workspace id is too short to delete by"});
+    }
+    let people: Vec<String> = members(store, ws)
+        .iter()
+        .map(|m| if text(m, "email").is_empty() { text(m, "uid") } else { text(m, "email") })
+        .collect();
+    let repo_ids = repos(store, ws, true);
+    let prefix = format!("{ws}:");
+    let mut scopes: BTreeSet<String> = store.list_scopes(&prefix).into_iter().collect();
+    scopes.extend(store.ledger_scopes_since(0.0).into_iter().filter(|s| s.starts_with(&prefix)));
+    scopes.extend(repo_ids.iter().map(|repo| format!("{prefix}{repo}")));
+
+    let keyed = store.kv_keys_containing(ws);
+    let mut deleted: BTreeMap<String, i64> = BTreeMap::new();
+    for (bucket, _) in &keyed {
+        *deleted.entry(bucket.clone()).or_default() += 1;
+    }
+    let mut pointers: Vec<(String, String)> = Vec::new();
+    let mut narrowed: Vec<(String, Value)> = Vec::new();
+    let mut left: BTreeMap<String, i64> = BTreeMap::new();
+    for (bucket, key, value) in store.kv_values_containing(ws) {
+        let listed = value.get("workspaces").and_then(Value::as_array).cloned().unwrap_or_default();
+        if bucket == crate::auth::TOKEN_BUCKET && text(&value, "workspace") != ws && listed.iter().any(|w| w.as_str() == Some(ws)) {
+            let mut kept = value.clone();
+            kept["workspaces"] = json!(listed.into_iter().filter(|w| w.as_str() != Some(ws)).collect::<Vec<_>>());
+            narrowed.push((key, kept));
+        } else if text(&value, "workspace") == ws || text(&value, "workspace_id") == ws {
+            *deleted.entry(bucket.clone()).or_default() += 1;
+            pointers.push((bucket, key));
+        } else {
+            *left.entry(bucket).or_default() += 1;
+        }
+    }
+    let ephemeral: Vec<String> = store.eph_scan("").into_iter().map(|(key, _)| key).filter(|key| key.contains(ws)).collect();
+    let ledger_kept: i64 = scopes.iter().map(|scope| store.ledger_count(scope)).sum();
+
+    if !dry_run {
+        let stamp = now();
+        for (bucket, key) in keyed.iter().chain(pointers.iter()) {
+            let _ = store.kv_delete(bucket, key);
+        }
+        for (key, kept) in &narrowed {
+            let _ = store.kv_put(crate::auth::TOKEN_BUCKET, key, kept, stamp);
+        }
+        for scope in &scopes {
+            let _ = store.delete_scope(scope);
+            crate::presence::forget_scope(store, scope);
+        }
+        for key in &ephemeral {
+            store.eph_delete(key);
+        }
+        // a repo that routed here is routed afresh on its next call
+        for repo in &repo_ids {
+            let _ = store.eph_set(&format!("wsrouteepoch:{}", crate::repo::path_key(repo)), &json!({"t": stamp}), Some(3600.0));
+        }
+        for window in [7, 30, 90, 365] {
+            store.eph_delete(&format!("admin:overview:{window}"));
+        }
+    }
+    json!({
+        "ok": true, "dry_run": dry_run,
+        "workspace": {"id": ws, "name": text(&workspace, "name"), "owner": text(&workspace, "owner")},
+        "members": people, "repos": repo_ids, "scopes": scopes,
+        "deleted": deleted, "credentials_narrowed": narrowed.len(), "ephemeral": ephemeral.len(),
+        "left": left, "ledger_rows_kept": ledger_kept,
+    })
+}
+
+/// A workspace its owner deleted, waiting out its 30 days: the marker (when,
+/// by whom, when it goes for good) under its id, and each of its rows under
+/// `<ws>|<bucket>|<key>`. Every key holds the id, so the final sweep
+/// (`delete_workspace`) takes these with the rest.
+pub const CLOSED_BUCKET: &str = "closed_ws";
+pub const CLOSED_ROWS: &str = "closed_ws_rows";
+/// How long a deleted workspace can still be restored.
+pub const CLOSED_KEEP_S: f64 = 30.0 * 86_400.0;
+
+/// An owner deletes a workspace, undoably for 30 days. Every row that names
+/// it (`delete_workspace`'s sweep: its record, members and their index
+/// rows, invites, settings, each repo's map, notes, messages and inboxes,
+/// the credentials bound to it) moves aside, so everyone loses access at
+/// once, nothing finds it, and its repos route afresh on their next call;
+/// its files, trees and ledger rows stay where they are until it goes.
+/// `restore_closed` puts it back; `purge_closed` deletes it for good once
+/// its 30 days are over.
+pub fn close_workspace(store: &Store, workspace_id: &str, by: &str) -> Value {
+    let ws = workspace_id.trim();
+    let Some(workspace) = get(store, ws) else {
+        return json!({"ok": false, "error": "no such workspace"});
+    };
+    if ws.len() < 8 {
+        return json!({"ok": false, "error": "that workspace id is too short to delete by"});
+    }
+    let stamp = now();
+    let repo_ids = repos(store, ws, true);
+    let mut rows: Vec<(String, String, Value)> = store
+        .kv_keys_containing(ws)
+        .into_iter()
+        .filter(|(bucket, _)| bucket != CLOSED_BUCKET && bucket != CLOSED_ROWS)
+        .filter_map(|(bucket, key)| store.kv_get(&bucket, &key).map(|value| (bucket, key, value)))
+        .collect();
+    // rows that point at it from a key of their own (a credential bound to
+    // it, an invite, a watch): one that only lists it among others stays
+    rows.extend(
+        store
+            .kv_values_containing(ws)
+            .into_iter()
+            .filter(|(_, _, value)| text(value, "workspace") == ws || text(value, "workspace_id") == ws),
+    );
+    for (bucket, key, value) in &rows {
+        let _ = store.kv_put(CLOSED_ROWS, &format!("{ws}|{bucket}|{key}"), &json!({"bucket": bucket, "key": key, "value": value}), stamp);
+        let _ = store.kv_delete(bucket, key);
+    }
+    for key in store.eph_scan("").into_iter().map(|(key, _)| key).filter(|key| key.contains(ws)) {
+        store.eph_delete(&key);
+    }
+    for repo in &repo_ids {
+        let _ = store.eph_set(&format!("wsrouteepoch:{}", crate::repo::path_key(repo)), &json!({"t": stamp}), Some(3600.0));
+    }
+    let purge_at = stamp + CLOSED_KEEP_S;
+    let _ = store.kv_put(CLOSED_BUCKET, ws, &json!({
+        "id": ws, "name": text(&workspace, "name"), "owner": text(&workspace, "owner"),
+        "by": by, "at": stamp, "purge_at": purge_at, "rows": rows.len(), "repos": repo_ids,
+    }), stamp);
+    json!({"ok": true, "name": text(&workspace, "name"), "purge_at": purge_at, "repos": repo_ids})
+}
+
+/// Undo an owner's deletion within its 30 days: every row goes back where
+/// it was. Support's, from the admin page.
+pub fn restore_closed(store: &Store, workspace_id: &str) -> Value {
+    let ws = workspace_id.trim();
+    let Some(marker) = store.kv_get(CLOSED_BUCKET, ws) else {
+        return json!({"ok": false, "error": "not a deleted workspace"});
+    };
+    let stamp = now();
+    let mut restored = 0;
+    for (key, row) in store.kv_list(CLOSED_ROWS, &format!("{ws}|")) {
+        if let Some(value) = row.get("value") {
+            let _ = store.kv_put(&text(&row, "bucket"), &text(&row, "key"), value, stamp);
+            restored += 1;
+        }
+        let _ = store.kv_delete(CLOSED_ROWS, &key);
+    }
+    let _ = store.kv_delete(CLOSED_BUCKET, ws);
+    json!({"ok": true, "name": text(&marker, "name"), "restored": restored})
+}
+
+/// Delete for good every workspace whose 30 days are over: its rows go back
+/// for the one sweep that takes everything (`delete_workspace`). How many.
+pub fn purge_closed(store: &Store, at: f64) -> usize {
+    let due: Vec<String> = store
+        .kv_list(CLOSED_BUCKET, "")
+        .into_iter()
+        .filter(|(_, marker)| num(marker, "purge_at") > 0.0 && num(marker, "purge_at") <= at)
+        .map(|(ws, _)| ws)
+        .collect();
+    for ws in &due {
+        restore_closed(store, ws);
+        delete_workspace(store, ws, false);
+    }
+    due.len()
+}
+
+/// The hourly purge of workspaces past their 30 days, on its own thread.
+#[cfg(feature = "cloud")]
+pub fn start_purger(store: std::sync::Arc<Store>) {
+    std::thread::Builder::new()
+        .name("collide-closed-ws".into())
+        .spawn(move || loop {
+            let gone = purge_closed(&store, now());
+            if gone > 0 {
+                tracing::info!("workspaces: {gone} deleted workspace(s) past their 30 days purged");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        })
+        .ok();
+}
+
+#[cfg(test)]
+mod closed_tests {
+    use super::*;
+
+    #[test]
+    fn a_deleted_workspace_vanishes_at_once_comes_back_on_restore_and_goes_after_30_days() {
+        let db = Store::open(std::path::Path::new(":memory:")).expect("in-memory store");
+        let (gone, kept) = ("aaaa1111bbbb", "cccc2222dddd");
+        let scope = format!("{gone}:github.com/acme/web");
+        db.kv_put("ws", gone, &json!({"id": gone, "name": "Acme", "owner": "u1"}), 1.0).unwrap();
+        db.kv_put("ws", kept, &json!({"id": kept, "name": "Collide", "owner": "u1"}), 1.0).unwrap();
+        db.kv_put("member", &format!("{gone}/u1"), &json!({"uid": "u1", "email": "bob@example.com", "role": "owner"}), 1.0).unwrap();
+        db.kv_put("member", &format!("{kept}/u1"), &json!({"uid": "u1", "email": "bob@example.com", "role": "owner"}), 1.0).unwrap();
+        // an index row names its workspace, as `add_member` writes it
+        db.kv_put("uws", &format!("u1/{gone}"), &json!({"workspace": gone, "role": "owner"}), 1.0).unwrap();
+        db.kv_put("uws", &format!("u1/{kept}"), &json!({"workspace": kept, "role": "owner"}), 1.0).unwrap();
+        db.kv_put("msgthread", &format!("{scope}:m1"), &json!({"message": "rename"}), 1.0).unwrap();
+        db.kv_put(crate::auth::TOKEN_BUCKET, "t1", &json!({"kind": "access", "uid": "u1", "workspace": gone}), 1.0).unwrap();
+
+        let closed = close_workspace(&db, gone, "bob@example.com");
+        assert_eq!(closed["ok"], json!(true), "{closed}");
+        // gone at once: no record, no member, not listed, its credential refused
+        assert!(get(&db, gone).is_none() && member(&db, gone, "u1").is_none());
+        assert_eq!(list_for(&db, "u1").iter().map(|w| text(w, "id")).collect::<Vec<_>>(), vec![kept.to_string()]);
+        assert!(db.kv_get(crate::auth::TOKEN_BUCKET, "t1").is_none());
+        assert!(db.kv_list("msgthread", &format!("{scope}:")).is_empty());
+        // the other workspace is untouched
+        assert!(get(&db, kept).is_some() && member(&db, kept, "u1").is_some());
+
+        // support restores it within the 30 days: all of it is back
+        assert_eq!(restore_closed(&db, gone)["ok"], json!(true));
+        assert!(get(&db, gone).is_some() && member(&db, gone, "u1").is_some());
+        assert!(db.kv_get(crate::auth::TOKEN_BUCKET, "t1").is_some());
+        assert_eq!(db.kv_list("msgthread", &format!("{scope}:")).len(), 1);
+        assert!(db.kv_list(CLOSED_ROWS, "").is_empty() && db.kv_get(CLOSED_BUCKET, gone).is_none());
+
+        // deleted again and left: nothing goes before its day, all of it after
+        close_workspace(&db, gone, "bob@example.com");
+        assert_eq!(purge_closed(&db, now() + 86_400.0), 0);
+        assert_eq!(purge_closed(&db, now() + CLOSED_KEEP_S + 1.0), 1);
+        assert!(get(&db, gone).is_none() && db.kv_list(CLOSED_ROWS, "").is_empty() && db.kv_get(CLOSED_BUCKET, gone).is_none());
+        assert!(db.kv_get(crate::auth::TOKEN_BUCKET, "t1").is_none() && db.kv_list("msgthread", &format!("{scope}:")).is_empty());
+        assert!(get(&db, kept).is_some());
+    }
+}
+
+#[cfg(test)]
+mod personal_tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open(std::path::Path::new(":memory:")).expect("in-memory store")
+    }
+
+    fn person(uid: &str, email: &str, name: &str) -> Principal {
+        Principal { uid: uid.into(), email: email.into(), name: name.into() }
+    }
+
+    #[test]
+    fn a_new_account_gets_one_personal_workspace_named_after_its_first_name() {
+        let s = store();
+        let alice = person("u-alice", "alice@example.test", "Alice Smith");
+        let made = ensure_personal(&s, &alice, &json!({})).expect("made at first sign-in");
+        assert_eq!(text(&made, "name"), "Alice's workspace");
+        assert_eq!(text(&made, "kind"), "personal");
+        assert_eq!(text(&made, "owner"), "u-alice");
+        assert_eq!(list_for(&s, "u-alice").len(), 1);
+        assert_eq!(text(&personal_for(&s, "u-alice").unwrap(), "id"), text(&made, "id"));
+    }
+
+    #[test]
+    fn making_it_is_idempotent_never_two() {
+        let s = store();
+        let alice = person("u-alice", "alice@example.test", "Alice");
+        assert!(ensure_personal(&s, &alice, &json!({})).is_some());
+        assert!(ensure_personal(&s, &alice, &json!({})).is_none(), "a second sign-in makes nothing");
+        assert!(ensure_personal(&s, &alice, &json!({})).is_none());
+        assert_eq!(owned_by(&s, "u-alice").len(), 1);
+    }
+
+    #[test]
+    fn concurrent_first_loads_make_one() {
+        let s = std::sync::Arc::new(store());
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = std::sync::Arc::clone(&s);
+                std::thread::spawn(move || {
+                    ensure_personal(&s, &person("u-race", "r@example.test", "Rae"), &json!({})).is_some()
+                })
+            })
+            .collect();
+        let made = handles.into_iter().map(|h| h.join().unwrap()).filter(|made| *made).count();
+        assert_eq!(made, 1);
+        assert_eq!(owned_by(&s, "u-race").len(), 1);
+    }
+
+    #[test]
+    fn an_account_that_has_one_already_gets_none() {
+        let s = store();
+        let ann = person("u-ann", "ann@example.test", "Ann");
+        let existing = create(&s, &ann, "", "personal", "").unwrap();
+        assert!(ensure_personal(&s, &ann, &json!({})).is_none());
+        let mine = list_for(&s, "u-ann");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(text(&mine[0], "id"), text(&existing, "id"));
+    }
+
+    #[test]
+    fn an_account_already_in_a_workspace_gets_none() {
+        // owns a team workspace (the Free plan's one): a second would break the cap
+        let s = store();
+        let bo = person("u-bo", "bo@example.test", "Bo");
+        create(&s, &bo, "acme-eng", "custom", "").unwrap();
+        assert!(ensure_personal(&s, &bo, &json!({})).is_none());
+        assert_eq!(owned_by(&s, "u-bo").len(), 1);
+        // invited first: a member somewhere already has a place
+        let cy = person("u-cy", "cy@example.test", "Cy");
+        let team = list_for(&s, "u-bo")[0].clone();
+        add_member(&s, &text(&team, "id"), &cy, "member", "u-bo", now());
+        assert!(ensure_personal(&s, &cy, &json!({})).is_none());
+        assert!(owned_by(&s, "u-cy").is_empty());
+    }
+
+    #[test]
+    fn never_again_once_made_or_the_account_was_closed() {
+        let s = store();
+        let di = person("u-di", "di@example.test", "Di");
+        let made = ensure_personal(&s, &di, &json!({})).unwrap();
+        // its only membership goes away: no second workspace appears
+        s.kv_delete("uws", &format!("u-di/{}", text(&made, "id"))).unwrap();
+        assert!(list_for(&s, "u-di").is_empty());
+        assert!(ensure_personal(&s, &di, &json!({})).is_none());
+        // a deleted account's stale token makes nothing either
+        let ed = person("u-ed", "ed@example.test", "Ed");
+        s.kv_put(PERSONAL_MADE_BUCKET, "u-ed", &json!({"closed": true}), now()).unwrap();
+        assert!(ensure_personal(&s, &ed, &json!({})).is_none());
+        assert!(list_for(&s, "u-ed").is_empty());
+    }
+
+    #[test]
+    fn the_name_comes_from_the_name_then_the_username_then_the_email() {
+        let named = person("u1", "x@example.test", "Alice Smith");
+        assert_eq!(personal_name_for(&named, &json!({})), "Alice's workspace");
+        assert_eq!(personal_name_for(&named, &json!({"name": "Bob Li"})), "Bob's workspace");
+        let handle = person("u2", "x@example.test", "");
+        assert_eq!(personal_name_for(&handle, &json!({"username": "alice-s"})), "alice-s's workspace");
+        assert_eq!(personal_name_for(&handle, &json!({"github_login": "octo"})), "octo's workspace");
+        assert_eq!(personal_name_for(&handle, &json!({})), "x's workspace");
+        // a test principal whose "name" is its uid, and no email: not a name
+        let bare = person("u3", "", "u3");
+        assert_eq!(personal_name_for(&bare, &json!({})), "My workspace");
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open(std::path::Path::new(":memory:")).expect("in-memory store")
+    }
+
+    #[test]
+    fn deleting_a_workspace_takes_its_rows_and_leaves_every_other_workspace_alone() {
+        let db = store();
+        let (gone, kept) = ("aaaa1111bbbb", "cccc2222dddd");
+        let (scope, other_scope) = (format!("{gone}:github.com/acme/web"), format!("{kept}:github.com/acme/api"));
+        db.kv_put("ws", gone, &json!({"id": gone, "name": "Acme", "owner": "u1"}), 1.0).unwrap();
+        db.kv_put("ws", kept, &json!({"id": kept, "name": "Collide", "owner": "u2"}), 1.0).unwrap();
+        db.kv_put("member", &format!("{gone}/u1"), &json!({"uid": "u1", "email": "bob@example.com", "role": "owner", "added": 1.0}), 1.0).unwrap();
+        db.kv_put("member", &format!("{gone}/u2"), &json!({"uid": "u2", "email": "k@x.io", "role": "member", "added": 2.0}), 1.0).unwrap();
+        db.kv_put("member", &format!("{kept}/u2"), &json!({"uid": "u2", "email": "k@x.io", "role": "owner", "added": 1.0}), 1.0).unwrap();
+        for key in [format!("u1/{gone}"), format!("u2/{gone}"), format!("u2/{kept}")] {
+            db.kv_put("uws", &key, &json!({"role": "member"}), 1.0).unwrap();
+        }
+        db.kv_put("ghrepo", &format!("{gone}:github.com/acme/web"), &json!({"repo_id": "github.com/acme/web"}), 1.0).unwrap();
+        db.kv_put("msgthread", &format!("{scope}:m1"), &json!({"from": "k@x.io", "message": "rename"}), 1.0).unwrap();
+        db.kv_put("inbox", &format!("{scope}:bob@example.com:m1"), &json!({"from": "k@x.io", "message": "rename"}), 1.0).unwrap();
+        db.kv_put("msgthread", &format!("{other_scope}:m2"), &json!({"from": "k@x.io", "message": "stays"}), 1.0).unwrap();
+        // credentials: one bound here, one that lists it among others, one elsewhere
+        db.kv_put(crate::auth::TOKEN_BUCKET, "t1", &json!({"kind": "access", "uid": "u1", "workspace": gone}), 1.0).unwrap();
+        db.kv_put(crate::auth::TOKEN_BUCKET, "t2", &json!({"kind": "access", "uid": "u2", "workspace": kept, "workspaces": [kept, gone]}), 1.0).unwrap();
+        db.kv_put(crate::auth::TOKEN_BUCKET, "t3", &json!({"kind": "access", "uid": "u2", "workspace": kept}), 1.0).unwrap();
+        // a pointer at the workspace goes; a record that only mentions it stays
+        db.kv_put("watch", "u2:github.com/acme/web", &json!({"workspace": gone}), 1.0).unwrap();
+        db.kv_put("history", "note", &json!({"said": format!("moved from {gone}")}), 1.0).unwrap();
+        db.eph_set(&format!("intent:{scope}:i1"), &json!({"owner": "k@x.io"}), Some(600.0)).unwrap();
+        db.eph_set(&format!("intent:{other_scope}:i2"), &json!({"owner": "k@x.io"}), Some(600.0)).unwrap();
+        db.ledger_append(&scope, "agent_message", &json!({"to": "bob@example.com", "from": "k@x.io", "chars": 6}), 1.0).unwrap();
+
+        let dry = delete_workspace(&db, gone, true);
+        assert_eq!(dry["ok"], json!(true));
+        assert_eq!(dry["dry_run"], json!(true));
+        assert_eq!(dry["workspace"]["name"], json!("Acme"));
+        assert_eq!(dry["members"], json!(["bob@example.com", "k@x.io"]));
+        assert_eq!(dry["deleted"], json!({"ghrepo": 1, "inbox": 1, "member": 2, "msgthread": 1, "oauth_token": 1, "uws": 2, "watch": 1, "ws": 1}));
+        assert_eq!(dry["credentials_narrowed"], json!(1));
+        assert_eq!(dry["left"], json!({"history": 1}));
+        assert_eq!(dry["ledger_rows_kept"], json!(1));
+        assert!(db.kv_get("ws", gone).is_some() && db.kv_get("inbox", &format!("{scope}:bob@example.com:m1")).is_some(), "a dry run changes nothing");
+
+        let applied = delete_workspace(&db, gone, false);
+        assert_eq!(applied["deleted"], dry["deleted"]);
+        assert!(db.kv_get("ws", gone).is_none());
+        assert!(members(&db, gone).is_empty());
+        assert!(db.kv_get("uws", &format!("u1/{gone}")).is_none() && db.kv_get("uws", &format!("u2/{gone}")).is_none());
+        assert!(db.kv_list("msgthread", &format!("{scope}:")).is_empty() && db.kv_list("inbox", &format!("{scope}:")).is_empty());
+        assert!(db.kv_get(crate::auth::TOKEN_BUCKET, "t1").is_none());
+        assert_eq!(db.kv_get(crate::auth::TOKEN_BUCKET, "t2").unwrap()["workspaces"], json!([kept]));
+        assert!(db.kv_get("watch", "u2:github.com/acme/web").is_none());
+        assert!(db.eph_get(&format!("intent:{scope}:i1")).is_none());
+        // everything of the other workspace, and the ledger, is where it was
+        assert!(db.kv_get("ws", kept).is_some() && db.kv_get("member", &format!("{kept}/u2")).is_some());
+        assert!(db.kv_get("uws", &format!("u2/{kept}")).is_some() && db.kv_get("msgthread", &format!("{other_scope}:m2")).is_some());
+        assert!(db.kv_get(crate::auth::TOKEN_BUCKET, "t3").is_some() && db.kv_get("history", "note").is_some());
+        assert!(db.eph_get(&format!("intent:{other_scope}:i2")).is_some());
+        assert_eq!(db.ledger_count(&scope), 1);
+
+        assert_eq!(delete_workspace(&db, gone, false)["error"], json!("no such workspace"));
+        db.kv_put("ws", "w1", &json!({"id": "w1", "name": "Short"}), 1.0).unwrap();
+        assert_eq!(delete_workspace(&db, "w1", false)["ok"], json!(false), "a short id would match strangers' rows");
+    }
 }

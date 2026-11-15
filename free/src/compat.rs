@@ -1,10 +1,8 @@
-//! Things that exist only to agree with Python.
-//!
-//! Both servers write the same rows and answer the same agents, so anywhere
-//! Python's formatting is observable — a number in a stored record, a list
-//! inside an error sentence an agent reads — this side has to produce the
-//! same characters. These are not helpers for convenience; each one is here
-//! because the obvious Rust spelling quietly disagrees.
+//! The formatting rules Cork's stored records and agent-facing text were
+//! defined with, which are Python's: rounding half to even, `repr`-style
+//! quoting of strings and lists inside error sentences, and truthiness.
+//! Records already written and sentences agents act on depend on them, so
+//! each one is here because the obvious Rust spelling quietly differs.
 
 use serde_json::Value;
 
@@ -12,8 +10,8 @@ use serde_json::Value;
 ///
 /// Rust's `f64::round` breaks ties away from zero and Python's breaks them to
 /// even, so the two disagree on exactly the values integer counts produce:
-/// sixteen edits with three unchecked is a rate of 0.8125, which Python
-/// reports as 0.812 and naive Rust as 0.813. Formatting is the fix rather
+/// sixteen edits with three unchecked is a rate of 0.8125, which rounds to
+/// 0.812 here and 0.813 with `f64::round`. Formatting is the fix rather
 /// than a workaround — Rust's float formatter rounds to nearest with ties to
 /// even over the true decimal value, which is what Python's `round` does,
 /// including the cases where scaling by a power of ten introduces its own
@@ -62,7 +60,7 @@ pub fn new_id() -> String {
     format!("{hash:016x}")[..12].to_string()
 }
 
-/// Python's list repr, which these error strings are compared against —
+/// A list in Python's repr, as error sentences spell it —
 /// single quotes, `, ` between items. Rust's `{:?}` uses double quotes.
 pub fn python_list(items: &[&str]) -> String {
     format!("[{}]", items.iter().map(|item| format!("'{item}'")).collect::<Vec<_>>().join(", "))
@@ -73,9 +71,8 @@ pub fn python_list(items: &[&str]) -> String {
 /// Python spells "is this set" as `if payload.get(k):`, which is false for a
 /// missing key, `None`, `false`, zero, and — the part that catches people —
 /// an empty string, list or object. Rust's obvious spelling is a null check,
-/// which disagrees on every one of those last three. Anywhere the Python side
-/// tests a field for truthiness, this side has to test it the same way, or
-/// the two disagree about whether a note was superseded or a tripwire fired.
+/// which disagrees on every one of those last three — and on whether a note
+/// was superseded or a tripwire fired.
 pub fn truthy(value: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,

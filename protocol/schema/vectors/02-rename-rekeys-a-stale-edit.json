@@ -1,0 +1,148 @@
+{
+  "name": "A rename moves the key; a stale body edit follows it",
+  "description": "modify_body x rename = rekey: Bob renames parse_config to load_config while Alice edits from version 1. Her edit lands on the new key without anyone reading code.",
+  "steps": [
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "alice-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "bob-1",
+        "agent_id": "codex-b",
+        "person": "bob@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "bob-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 1,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": ""
+        },
+        "kind": "modify_body",
+        "hlc": {
+          "w": 1,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "version": 1,
+            "hash": "$bind:h1"
+          }
+        }
+      ]
+    },
+    {
+      "at": 2,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 1,
+          "hash": "$ref:h1"
+        },
+        "kind": "rename",
+        "public": {
+          "new_name": "load_config"
+        },
+        "hlc": {
+          "w": 2,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "ack",
+            "op_id": "bob-1.1",
+            "key": "code:src/cli.py::parse_config",
+            "version": 2,
+            "moved_to": {
+              "key": "code:src/cli.py::load_config",
+              "version": 1
+            }
+          }
+        }
+      ]
+    },
+    {
+      "at": 3,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.2",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 1,
+          "hash": "$ref:h1"
+        },
+        "kind": "modify_body",
+        "hlc": {
+          "w": 3,
+          "c": 0
+        }
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "op_id": "alice-1.2",
+            "key": "code:src/cli.py::load_config",
+            "version": 2,
+            "rekeyed_to": "code:src/cli.py::load_config"
+          }
+        }
+      ]
+    }
+  ]
+}

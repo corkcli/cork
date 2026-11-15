@@ -1,0 +1,31 @@
+{
+  "domain": "notes",
+  "version": 1,
+  "prefixes": ["note:"],
+  "coalesce_ms": 100,
+  "kinds": {
+    "edit_text": { "doc": "Replace the note's text.", "public": [] },
+    "retitle":   { "doc": "Give the note a new title; its key becomes note:<public.new_slug>.", "public": ["new_slug"], "moves_key": true },
+    "link":      { "doc": "Reference another note (public.target, a note key).", "public": ["target"] },
+    "unlink":    { "doc": "Drop a reference (public.target).", "public": ["target"] },
+    "delete":    { "doc": "Remove the note.", "public": [] },
+    "append":    { "doc": "Add text at the end of the note.", "public": [] }
+  },
+  "relations": {
+    "edit_text": { "edit_text": "conflict", "retitle": "rekey",    "link": "commute",  "unlink": "commute",  "delete": "conflict", "append": "conflict" },
+    "retitle":   { "edit_text": "commute",  "retitle": "conflict", "link": "commute",  "unlink": "commute",  "delete": "conflict", "append": "commute" },
+    "link":      { "edit_text": "commute",  "retitle": "rekey",    "link": "commute",  "unlink": "commute",  "delete": "conflict", "append": "commute" },
+    "unlink":    { "edit_text": "commute",  "retitle": "rekey",    "link": "commute",  "unlink": "commute",  "delete": "conflict", "append": "commute" },
+    "delete":    { "edit_text": "conflict", "retitle": "conflict", "link": "conflict", "unlink": "conflict", "delete": "commute",  "append": "conflict" },
+    "append":    { "edit_text": "conflict", "retitle": "rekey",    "link": "commute",  "unlink": "commute",  "delete": "conflict", "append": "commute" }
+  },
+  "notes": {
+    "append/append": "Appends commute: both land, in sequence order.",
+    "edit_text/edit_text": "Two rewrites of one text: merge locally.",
+    "edit_text/append": "A rewrite of text someone just added to.",
+    "append/edit_text": "Appending to a text someone just rewrote: the anchor moved.",
+    "edit_text/retitle": "The note was renamed; the edit follows it.",
+    "link/unlink": "Links are a set ordered by sequence: the later op wins for the same target.",
+    "delete/delete": "Deleting twice is deleting once."
+  }
+}

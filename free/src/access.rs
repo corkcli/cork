@@ -1,12 +1,12 @@
 //! Membership is workspace-wide; ACCESS is per repo.
 //!
 //! There is no ghost mode. The rest of the team reports on a repo through
-//! Collide, so working on it unobserved is exactly what Collide exists to
+//! Cork, so working on it unobserved is exactly what Cork exists to
 //! prevent — which is why a refusal here is a refusal to record, not a
 //! refusal to read.
 //!
 //! Fails OPEN on infrastructure trouble and CLOSED only on an explicit
-//! denial, matching the Python original: a GitHub lookup that cannot run
+//! denial: a GitHub lookup that cannot run
 //! must not lock a legitimate member out of reporting their work.
 
 use std::collections::BTreeSet;
@@ -19,12 +19,12 @@ use crate::presence::agent_id;
 use crate::repo::repo_key;
 use crate::store::{now, Store};
 
-// ---- the plan gate: what a plan sells, said once, the same on both halves ----
+// ---- the plan gate: what a plan sells, said once ----
 //
 // "Gate on how much you use it and who you use it with, never on how well it
 // works." Every notice below names a count or a window and the billing page;
-// none of them ever stops a write. The strings are byte-identical to the
-// Python half's (service.py) — an agent reads whichever server answered.
+// none of them ever stops a write. Agents read these strings; keep them
+// stable.
 
 /// A VIEWER (effective access "read": a member on Free, or one the owner
 /// set to read on a live plan) sees the dashboard; their agents get
@@ -33,15 +33,15 @@ use crate::store::{now, Store};
 /// which names the room, who IS covered and who to ask. `{covered}` is
 /// "{owner} and {players} are" or, when the owner is the only player,
 /// "{owner} is" (see [`viewer_notice`]).
-pub const VIEWER_NOTICE: &str = "Collide can't see this because you don't have a seat in {workspace}. \
-{covered} covered, you aren't: nothing you write is recorded, briefed or collision-checked. Ask {owner} for \
-a seat at {billing_url}.";
+pub const VIEWER_NOTICE: &str = "Cork can't see this because you're a viewer in {workspace}. \
+{covered} covered, you aren't: nothing you write is recorded, briefed or collision-checked. Ask {owner} to \
+make you a player (with units, any member can be one): {billing_url}.";
 /// The player-side half of the same fact, told once per session to every
 /// player's agent while the workspace has viewers: the teammates whose
-/// work Collide cannot see, and where to add them. `{are}`/`{viewers}`
+/// work Cork cannot see, and where to add them. `{are}`/`{viewers}`
 /// follow the count: "bob is … They're a viewer" for one, "erin and frank
 /// are … They're viewers" for more.
-pub const VIEWERS_NUDGE: &str = "Collide can't see what {names} {are} doing in this repo. They're {viewers}, \
+pub const VIEWERS_NUDGE: &str = "Cork can't see what {names} {are} doing in this repo. They're {viewers}, \
 so their agents don't report, and their edits won't show up in your collision checks. Add them at \
 {billing_url}.";
 /// How many people a notice names before "and N more".
@@ -53,9 +53,9 @@ pub const AGENT_CAP_NOTICE: &str = "{cap} agents at once is the {plan} plan's li
 and shows on the dashboard, but gets no briefing, notes or recipes until another of your agents finishes. \
 Tell the human: unlimited agents at once is Team, at {billing_url}";
 pub const MESSAGING_NOTICE: &str = "messaging reaches only your own agents on the {plan} plan — a message to \
-{to}'s agents is Team. Tell the human: the owner can move up in about a minute at {billing_url}";
+{to}'s agents needs units. Tell the human: the owner can add units in about a minute at {billing_url}";
 pub const COMPLIANCE_NOTICE: &str = "the compliance export (the full ledger of every agent action, \
-hash-chained) is Business and up — this workspace is on {plan}. The owner can move up at {billing_url}";
+hash-chained) is on Enterprise — this workspace is on {plan}. The owner can ask about it at {billing_url}";
 /// How long "this session was told" and "this session is over the cap"
 /// stand: a session is a conversation, and a conversation rarely outlives
 /// an hour of silence; after that the count is taken afresh.
@@ -66,9 +66,8 @@ pub const VIEWERS_NUDGE_EVERY_S: f64 = 7.0 * 86_400.0;
 pub const AGENT_CAP_TTL_S: f64 = 3600.0;
 
 /// The billing page every notice points at — the dashboard origin plus
-/// /dashboard/billing, the string `BillingService._billing_url` builds. The
-/// Python app hands its service the ORIGIN of COLLIDE_DASHBOARD_URL; the
-/// Rust `App` carries the raw value, so it is reduced to the origin here.
+/// /dashboard/billing. The `App` carries CORK_DASHBOARD_URL raw, so it
+/// is reduced to its origin here.
 pub fn billing_url(dashboard_url: &str) -> String {
     let trimmed = dashboard_url.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -83,7 +82,6 @@ pub fn billing_url(dashboard_url: &str) -> String {
 
 /// The workspace's seat roster: its display name, the owner, the other
 /// PLAYERS (effective access "write") and the VIEWERS, in member order.
-/// Python's `_seat_roster`, member for member.
 pub struct Roster {
     pub name: String,
     pub owner: Option<Value>,
@@ -121,12 +119,23 @@ pub fn seat_roster(store: &Store, workspace_id: &str) -> Roster {
     roster
 }
 
+/// The names `reader` keeps for other people (their nicknames), without one
+/// for `reader` themself: a person's own name is their username, whatever a
+/// nickname saved before that rule says. Every read of the "nicknames"
+/// bucket goes through here.
+pub fn nicknames_of(store: &Store, reader: &str) -> Value {
+    let mut nicks = store.kv_get("nicknames", reader).and_then(|v| v.as_object().cloned()).unwrap_or_default();
+    let me = reader.split('#').next().unwrap_or(reader).trim();
+    nicks.retain(|who, _| !who.trim().eq_ignore_ascii_case(me));
+    Value::Object(nicks)
+}
+
 /// Display names for a notice, in the order `identity_labels` resolves
 /// them: the caller's own nickname for the person, else their claimed
 /// username, else the identity itself (the email). Nicknames are private to
 /// `caller`, so two people reading the same notice may see different names.
 pub fn display_names(store: &Store, caller: &str, users: &[String]) -> Vec<String> {
-    let nicks = store.kv_get("nicknames", caller).unwrap_or(Value::Null);
+    let nicks = nicknames_of(store, caller);
     users
         .iter()
         .map(|user| {
@@ -145,7 +154,7 @@ pub fn display_names(store: &Store, caller: &str, users: &[String]) -> Vec<Strin
 
 /// "a, b and c" — up to [`NAMES_SHOWN`] names, the last joined with "and";
 /// past that, "a, b, c, d, e and N more" (commas only, so the two "and"s
-/// never meet). Python's `name_list`.
+/// never meet).
 pub fn name_list(names: &[String]) -> String {
     let shown: Vec<&str> = names.iter().take(NAMES_SHOWN).map(String::as_str).collect();
     if names.len() > NAMES_SHOWN {
@@ -159,7 +168,7 @@ pub fn name_list(names: &[String]) -> String {
 
 /// The viewer's line, for `user` (the viewer, whose nicknames name the
 /// others): the workspace by name, the owner and the other players as the
-/// ones covered, the owner as the one to ask. Python's `viewer_notice`.
+/// ones covered, the owner as the one to ask.
 pub fn viewer_notice(store: &Store, workspace_id: &str, user: &str, dashboard_url: &str) -> String {
     let roster = seat_roster(store, workspace_id);
     let owner_id = roster.owner.as_ref().map(member_label).unwrap_or_default();
@@ -187,8 +196,7 @@ pub fn viewer_notice(store: &Store, workspace_id: &str, user: &str, dashboard_ur
 /// VIEWERS_NUDGE_EVERY_S) while the workspace has viewers; `None` otherwise.
 /// The stamp lands on the first check, so a workspace without viewers costs
 /// one ephemeral read a week, not a member walk per call. Never blocks
-/// anything: it rides a response the agent already receives. Python's
-/// `viewers_nudge`.
+/// anything: it rides a response the agent already receives.
 pub fn viewers_nudge(store: &Store, workspace_id: &str, user: &str, session: &str, dashboard_url: &str) -> Option<String> {
     let _ = session;
     let key = format!("viewersnudge:{workspace_id}:{user}");
@@ -263,8 +271,8 @@ impl Plan {
 
 /// `plan_of`'s answer plus its table entry: a lapsed trial already reads as
 /// Free. (billing::plan_of never fails — a store it cannot read answers the
-/// Free default — so the Python "billing unreadable → unlimited" branch has
-/// no Rust twin to fail open through.)
+/// Free default — so there is no "billing unreadable → unlimited" branch
+/// to fail open through.)
 pub fn plan_for(store: &Store, workspace_id: &str) -> Plan {
     Plan { def: plan_def_of(&billing::plan_of(store, workspace_id)) }
 }
@@ -316,8 +324,7 @@ pub fn tell_once(store: &Store, key: &str, ttl_s: f64) -> bool {
 /// the hooks and the MCP session write). A session with no marker yet that
 /// arrives when the count is at the cap is over it, and stays over it for
 /// AGENT_CAP_TTL_S — its own reports still land and the owner SEES the extra
-/// agent on Now; what it does not get is the briefing. Python's
-/// `agent_cap_state`, step for step.
+/// agent on Now; what it does not get is the briefing.
 pub fn agent_cap_state(store: &Store, workspace_id: &str, user: &str, session: &str, dashboard_url: &str) -> (bool, String) {
     let plan = plan_for(store, workspace_id);
     let Some(cap) = plan.count("agents_concurrent") else { return (false, String::new()) };
@@ -379,7 +386,9 @@ pub fn messaging_refusal(store: &Store, workspace_id: &str, sender: &str, to: &s
     if plan.word("messaging", "team") != "own" {
         return None;
     }
-    if to.trim().to_lowercase() == sender.trim().to_lowercase() {
+    // one of the sender's own sessions (`user#session`) is the sender's own agent
+    let person = |who: &str| who.split('#').next().unwrap_or(who).trim().to_lowercase();
+    if person(to) == person(sender) {
         return None;
     }
     Some(
@@ -392,7 +401,7 @@ pub fn messaging_refusal(store: &Store, workspace_id: &str, sender: &str, to: &s
 
 /// limits.messaging "own": teammates' messages stay in the box unread — the
 /// sender was told at send time; a message that landed while the plan was
-/// live simply waits for the plan. Python's `inbox`, filter for filter.
+/// live simply waits for the plan.
 pub fn own_messages_only(store: &Store, workspace_id: &str, user_id: &str, mut inbox: Value, dashboard_url: &str) -> Value {
     let plan = plan_for(store, workspace_id);
     if plan.word("messaging", "team") != "own" {
@@ -403,7 +412,10 @@ pub fn own_messages_only(store: &Store, workspace_id: &str, user_id: &str, mut i
     let mine = user_id.trim().to_lowercase();
     let kept: Vec<Value> = messages
         .iter()
-        .filter(|m| m.get("from").and_then(Value::as_str).unwrap_or("").trim().to_lowercase() == mine)
+        .filter(|m| {
+            let from = m.get("from").and_then(Value::as_str).unwrap_or("");
+            from.split('#').next().unwrap_or(from).trim().to_lowercase() == mine
+        })
         .cloned()
         .collect();
     let withheld = messages.len() - kept.len();
@@ -497,8 +509,8 @@ where
     scopes
         .into_iter()
         .filter(|scope| {
-            // "<ws>:<repo>"; a scope with no separator has no repo half, and
-            // Python's str.partition(":")[2] reads that as the empty repo too
+            // "<ws>:<repo>"; a scope with no separator has no repo half, which
+            // reads as the empty repo
             let repo = scope.as_ref().split_once(':').map(|(_ws, repo)| repo).unwrap_or("");
             has_repo_access(member, repo)
         })
@@ -535,35 +547,6 @@ pub fn visible_scopes(store: &Store, workspace_id: &str, member: Option<&Value>)
     scopes_visible_to(member, scopes)
 }
 
-/// "ok" | "removed" | "unverified" | "off".
-///
-/// Only the cached collaborator list is consulted — this half never calls
-/// GitHub. A cold cache reads as "off", which is the same fail-open answer
-/// the Python side gives when the lookup cannot run.
-fn github_verdict(store: &Store, workspace_id: &str, repo_id: &str, uid: &str) -> &'static str {
-    let Some(integration) = store.kv_get("ghintegration", workspace_id) else { return "off" };
-    if integration.get("enabled").and_then(Value::as_bool) == Some(false) {
-        return "off";
-    }
-    let login = store
-        .kv_get("profile", uid)
-        .and_then(|profile| {
-            profile.get("github_login").and_then(Value::as_str).map(|s| s.trim().to_lowercase())
-        })
-        .unwrap_or_default();
-    if login.is_empty() {
-        return "unverified";
-    }
-    let cached = store.eph_get(&format!("ghcollab:{workspace_id}:{}", repo_key(repo_id)));
-    let Some(cached) = cached else { return "off" };
-    let Some(logins) = cached.get("logins").and_then(Value::as_array) else { return "off" };
-    let present = logins
-        .iter()
-        .filter_map(Value::as_str)
-        .any(|candidate| candidate.trim().to_lowercase() == login);
-    if present { "ok" } else { "removed" }
-}
-
 /// The invite's half of the rule. The PLAN's half — a member whose
 /// EFFECTIVE access (`access_of`: the stored toggle read through the live
 /// plan) is "read" is a viewer whose agents may look but never record — is
@@ -588,18 +571,14 @@ invite — without one you cannot see or report on your teammates' work"
             .unwrap_or_else(|| workspace_id.to_string());
         return Access::Denied(format!(
             "no access to '{repo_id}' in workspace '{name}': your invite covers other repos. \
-There is no ghost mode — the rest of the team reports on this repo through Collide, so working \
+There is no ghost mode — the rest of the team reports on this repo through Cork, so working \
 on it unobserved isn't available. Tell the human to ask the workspace owner to check this repo \
 off on their access list (dashboard Settings > Members)."
         ));
     }
-    if github_verdict(store, workspace_id, repo_id, uid) == "removed" {
-        return Access::Denied(format!(
-            "your GitHub account is no longer a collaborator on '{repo_id}', so Collide will not \
-record work on it — nothing you edit locally appears to the team. Tell the human: regain access \
-on GitHub (or have the owner reconnect), then retry."
-        ));
-    }
+    // Cork's own membership is the whole rule: GitHub is only a sign-in
+    // and is never asked who may see a repo, so removing someone on GitHub
+    // does not remove them here. The owner removes them, or unticks repos.
     Access::Allowed
 }
 
@@ -607,7 +586,7 @@ on GitHub (or have the owner reconnect), then retry."
 /// before and after, the notes, rationales and recipes agents left. With
 /// those, a viewer could hand a teammate's work to an agent of their own;
 /// without them the dashboard still shows who is on what, the collisions
-/// and what Collide saved.
+/// and what Cork saved.
 const VIEWER_HIDDEN: &[&str] = &[
     "hunks", "signature", "signature_before", "signature_after", "signature_change", "detail", "before", "after",
     "fact", "note", "notes", "rationale", "rationales", "latest", "recipe", "recipes", "conventions",

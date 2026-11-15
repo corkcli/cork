@@ -1,0 +1,209 @@
+{
+  "name": "The same result is acked, and landed history goes over drafts",
+  "description": "Two sessions that make a key the same content are not in conflict: the second is acked at the key's head with same_as, nothing is applied and nobody is told. An op id starting git. is a commit that already landed on the shared branch: it is accepted over the drafts it meets, promoted as it lands, and a writer on an older draft meets it as a conflict (SPEC 5.2, 10.1).",
+  "steps": [
+    {
+      "at": 0,
+      "conn": "alice",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "alice-1",
+        "agent_id": "claude-a",
+        "person": "alice@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "alice-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "hello",
+        "proto": 1,
+        "session": "bob-1",
+        "agent_id": "codex-b",
+        "person": "bob@example.com",
+        "scope": "acme/api"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "welcome",
+            "proto": 1,
+            "session": "bob-1",
+            "resumed": false,
+            "resumed_leases": []
+          }
+        }
+      ]
+    },
+    {
+      "at": 0,
+      "conn": "bob",
+      "send": {
+        "t": "subscribe",
+        "keys": [
+          "code:src/cli.py::parse_config"
+        ],
+        "depth": 0
+      },
+      "expect": []
+    },
+    {
+      "at": 1,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "",
+          "content": "H0"
+        },
+        "kind": "insert",
+        "hlc": {
+          "w": 1,
+          "c": 0
+        },
+        "content_hash": "H1"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "ack",
+            "op_id": "alice-1.1",
+            "key": "code:src/cli.py::parse_config",
+            "version": 1,
+            "hash": "$bind:h1"
+          }
+        },
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "delta",
+            "version": 1,
+            "layer": "draft",
+            "op": {
+              "op_id": "alice-1.1"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "at": 2,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "bob-1.1",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "",
+          "content": "H0"
+        },
+        "kind": "insert",
+        "hlc": {
+          "w": 2,
+          "c": 0
+        },
+        "content_hash": "H1"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "ack",
+            "op_id": "bob-1.1",
+            "key": "code:src/cli.py::parse_config",
+            "version": 1,
+            "hash": "$ref:h1",
+            "same_as": "alice-1.1"
+          }
+        }
+      ]
+    },
+    {
+      "at": 3,
+      "conn": "bob",
+      "send": {
+        "t": "op",
+        "op_id": "git.0a1b2c3d4e5f6a7b.0",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "",
+          "content": "H0"
+        },
+        "kind": "modify_body",
+        "hlc": {
+          "w": 3,
+          "c": 0
+        },
+        "content_hash": "H5"
+      },
+      "expect": [
+        {
+          "conn": "bob",
+          "recv": {
+            "t": "ack",
+            "op_id": "git.0a1b2c3d4e5f6a7b.0",
+            "key": "code:src/cli.py::parse_config",
+            "version": 2
+          }
+        }
+      ]
+    },
+    {
+      "at": 4,
+      "conn": "alice",
+      "send": {
+        "t": "op",
+        "op_id": "alice-1.2",
+        "key": "code:src/cli.py::parse_config",
+        "base": {
+          "version": 0,
+          "hash": "",
+          "content": "H1"
+        },
+        "kind": "modify_body",
+        "hlc": {
+          "w": 4,
+          "c": 0
+        },
+        "content_hash": "H6"
+      },
+      "expect": [
+        {
+          "conn": "alice",
+          "recv": {
+            "t": "reject",
+            "op_id": "alice-1.2",
+            "reason": "conflict",
+            "theirs": [
+              {
+                "op_id": "git.0a1b2c3d4e5f6a7b.0",
+                "layer": "promoted"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

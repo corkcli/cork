@@ -1,4 +1,4 @@
-//! The free version has no embedding model: prompts are matched to code by the names they use; the cloud's lives in Collide's private
+//! The free version has no embedding model: prompts are matched to code by the names they use; the cloud's lives in Cork's private
 //! repo. These are its free answers, under the same names, so the engine
 //! builds and runs on one machine without it.
 
@@ -10,6 +10,10 @@ use crate::store::Store;
 
 /// The id a file's own (module-level) entry goes by.
 pub const MODULE: &str = "<module>";
+
+/// The cloud's vector rows, by file: none are kept here, but the map's
+/// cleanup (codegraph::forget_files) names the bucket in both builds.
+pub const BUCKET: &str = "embed";
 
 pub fn health() -> Option<Value> {
     None
@@ -29,7 +33,9 @@ pub fn persist_now() -> usize {
     0
 }
 
-pub fn enqueue(_scope: &str, _path: &str, _doc: &str, _symbols: &Map<String, Value>, _live: bool) {}
+pub fn enqueue(_scope: &str, _path: &str, _doc: &str, _symbols: &Map<String, Value>, _live: bool) -> usize {
+    0
+}
 
 pub fn pending_for(_scope: &str) -> usize {
     0

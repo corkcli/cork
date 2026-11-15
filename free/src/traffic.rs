@@ -12,8 +12,7 @@
 //! re-checked, and a group that has come free is released into the
 //! planner's next deltas line. The clearest place this lands is subagents
 //! spawned in parallel, blind to each other: the parent gets a provable
-//! split instead of a guess. Python's `_traffic_gate` / `_release_held`,
-//! same verdicts, same rows.
+//! split instead of a guess.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -108,8 +107,8 @@ pub fn gate(
 ) -> Value {
     let me = agent_of(user, session);
     let stamp = now();
-    // the plan's id is what it is of: the person and the units, so both
-    // halves name the same plan the same way and a re-plan finds its queue
+    // the plan's id is what it is of: the person and the units, so the same
+    // plan always gets the same id and a re-plan finds its queue
     let plan_id = {
         use sha1::{Digest, Sha1};
         let key: Vec<String> = units.iter().map(|u| format!("{}::{}:{}", text(u, "path"), text(u, "symbol"), text(u, "op"))).collect();
@@ -172,7 +171,7 @@ pub fn gate(
         map.insert("released".into(), json!(released));
         map.insert("dispatched".into(), json!(dispatch));
         map.insert("traffic".into(), json!(format!(
-            "{} group(s) can run now, {} held until the agents in their way finish; releases arrive in your context as Collide lines",
+            "{} group(s) can run now, {} held until the agents in their way finish; releases arrive in your context as Cork lines",
             run_now.len(), hold.len())));
     }
     out
@@ -180,7 +179,7 @@ pub fn gate(
 
 /// An intent completed: every held group in the scope is checked again, and
 /// each one that has come free moves to its planner's released list, with a
-/// collision-prevented row priced for the planner. Python's `_release_held`.
+/// collision-prevented row priced for the planner.
 pub fn release_after(store: &Store, scope: &str, finished_user: &str, finished_session: &str) {
     let stamp = now();
     let freed_by = agent_of(finished_user, finished_session);
@@ -215,6 +214,8 @@ pub fn release_after(store: &Store, scope: &str, finished_user: &str, finished_s
         let rkey = released_key(scope, &user, &session);
         let mut list: Vec<Value> = store.eph_get(&rkey).and_then(|v| v.as_array().cloned()).unwrap_or_default();
         for group in &freed {
+            crate::outcomes::open(store, scope, "plan_hold", &user, &session, &strings(group, "files"),
+                json!({"freed_by": freed_by}), stamp);
             crate::briefstat::record_saving(
                 store, scope, "collision_prevented", &user, "plan_work", &session, PREVENTED_MESSAGES,
                 &json!({"group": group.get("n").cloned().unwrap_or(Value::Null), "paths": group.get("files").cloned().unwrap_or(json!([])),
@@ -257,7 +258,7 @@ pub fn release_lines(store: &Store, scope: &str, user: &str, session: &str) -> V
             (g, files, who)
         })
         .map(|(g, files, who)| format!(
-            "Collide traffic: group {} ({}) can run now, {} finished. Start it, or plan_work(dispatch=true) again to claim it.",
+            "Cork traffic: group {} ({}) can run now, {} finished. Start it, or plan_work(dispatch=true) again to claim it.",
             g.get("n").and_then(Value::as_u64).unwrap_or(0), files.join(", "), if who.is_empty() { "the agent in its way".to_string() } else { who }))
         .collect();
     let _ = BTreeMap::<String, String>::new();
