@@ -1540,7 +1540,7 @@ pub fn server_card(mcp_url: &str) -> Value {
         "description": "Keeps AI coding agents on one codebase from overwriting each other, and briefs each on its code.",
         "version": env!("CARGO_PKG_VERSION"),
         "websiteUrl": "https://corkcli.com/docs/mcp-tools",
-        "repository": {"url": "https://github.com/lithometric/cork", "source": "github"},
+        "repository": {"url": "https://github.com/corkcli/cork", "source": "github"},
         "icons": [{"src": "https://corkcli.com/brand/cork-mark-black.svg", "mimeType": "image/svg+xml"}],
         "remotes": [{
             "type": "streamable-http",

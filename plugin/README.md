@@ -23,7 +23,7 @@ In our benchmark (12 agents at once on one repository, hard tasks), agents with 
 In Claude Code, send these as two separate messages:
 
 ```
-/plugin marketplace add lithometric/cork
+/plugin marketplace add corkcli/cork
 ```
 ```
 /plugin install cork@cork
@@ -34,7 +34,7 @@ Installed before the rename, as `collide@collide`? Run `/plugin uninstall collid
 In Codex:
 
 ```
-codex plugin marketplace add lithometric/cork
+codex plugin marketplace add corkcli/cork
 codex plugin add cork@cork
 ```
 
@@ -90,7 +90,7 @@ Free is everything on one machine: unlimited agents and repositories, no account
 
 ## License
 
-This plugin (the hooks, the launcher and the commands in this repository) is MIT licensed. The `cork` program it downloads is built from the source in [lithometric/cork](https://github.com/lithometric/cork): its hooks and code parser are MIT, its local engine FSL-1.1-MIT (each version becomes MIT two years after release). Cork's cloud service is not open source; it is free to use under Cork's terms.
+This plugin (the hooks, the launcher and the commands in this repository) is MIT licensed. The `cork` program it downloads is built from the source in [corkcli/cork](https://github.com/corkcli/cork): its hooks and code parser are MIT, its local engine FSL-1.1-MIT (each version becomes MIT two years after release). Cork's cloud service is not open source; it is free to use under Cork's terms.
 
 ## Frequently asked questions
 
@@ -101,8 +101,8 @@ Install this plugin (two messages, above) and start your agents as usual. They s
 No. The hooks do the work with no extra model calls. The MCP server, which the plugin adds, gives an agent tools it can call on purpose; it asks you to sign in the first time one is used.
 
 **Does it work with Codex and Cursor?**
-Yes. The first session also sets Cork up for Codex and Cursor where they are installed (above). Codex can install this plugin too, for the skills and the MCP server. Without Claude Code, install Cork for the whole machine: `curl -fsSL https://corkcli.com/install.sh | sh` or `npx corkcli` ([lithometric/cork](https://github.com/lithometric/cork)).
+Yes. The first session also sets Cork up for Codex and Cursor where they are installed (above). Codex can install this plugin too, for the skills and the MCP server. Without Claude Code, install Cork for the whole machine: `curl -fsSL https://corkcli.com/install.sh | sh` or `npx corkcli` ([corkcli/cork](https://github.com/corkcli/cork)).
 
 ---
 
-If Cork saved your agents a merge conflict, a **star** helps other developers running parallel Claude Code agents find it. Website: [corkcli.com](https://corkcli.com) · Free version and source: [lithometric/cork](https://github.com/lithometric/cork)
+If Cork saved your agents a merge conflict, a **star** helps other developers running parallel Claude Code agents find it. Website: [corkcli.com](https://corkcli.com) · Free version and source: [corkcli/cork](https://github.com/corkcli/cork)

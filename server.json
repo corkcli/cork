@@ -4,7 +4,7 @@
   "title": "Cork",
   "description": "Keeps AI coding agents on one codebase from overwriting each other, and briefs each on its code.",
   "repository": {
-    "url": "https://github.com/lithometric/cork",
+    "url": "https://github.com/corkcli/cork",
     "source": "github"
   },
   "websiteUrl": "https://corkcli.com",

@@ -24,13 +24,13 @@ One install covers every repository on the machine. Agents already open pick it 
 Or as a plugin. In Claude Code, send these as two separate messages:
 
 ```
-/plugin marketplace add lithometric/cork
+/plugin marketplace add corkcli/cork
 ```
 ```
 /plugin install cork@cork
 ```
 
-In Codex: `codex plugin marketplace add lithometric/cork`, then `codex plugin add cork@cork`. What the plugin brings and does: [plugin/README.md](plugin/README.md).
+In Codex: `codex plugin marketplace add corkcli/cork`, then `codex plugin add cork@cork`. What the plugin brings and does: [plugin/README.md](plugin/README.md).
 
 ## Why
 
@@ -114,7 +114,7 @@ cd free && cargo build --release
 Cork's official agent skills are in [`skills/`](skills): setting Cork up, working with its briefings and write gate, handing work off and messaging other agents, and reading what Cork recorded. Install them for any agent that reads skills:
 
 ```sh
-npx skills add lithometric/cork
+npx skills add corkcli/cork
 ```
 
 ## Documentation
@@ -139,4 +139,4 @@ The engine's license lets you use, change and share it for anything except offer
 
 ---
 
-If Cork saved your agents a merge conflict, a **star** helps other developers running parallel agents find it. Questions and ideas: [open an issue](https://github.com/lithometric/cork/issues). Website: [corkcli.com](https://corkcli.com) · Claude Code plugin: [lithometric/cork](https://github.com/lithometric/cork/tree/main/plugin)
+If Cork saved your agents a merge conflict, a **star** helps other developers running parallel agents find it. Questions and ideas: [open an issue](https://github.com/corkcli/cork/issues). Website: [corkcli.com](https://corkcli.com) · Claude Code plugin: [corkcli/cork](https://github.com/corkcli/cork/tree/main/plugin)

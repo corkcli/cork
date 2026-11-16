@@ -8,7 +8,7 @@
     "url": "https://corkcli.com"
   },
   "homepage": "https://corkcli.com",
-  "repository": "https://github.com/lithometric/cork",
+  "repository": "https://github.com/corkcli/cork",
   "license": "MIT",
   "keywords": [
     "multi-agent",

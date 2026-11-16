@@ -13,17 +13,17 @@ them. The free version needs no account.
 
 ## Install
 
-Run one of these in a shell and wait for it to finish:
-
-```sh
-curl -fsSL https://corkcli.com/install.sh | sh
-```
-
-or, with Node (any terminal, including Windows PowerShell):
+Ask the user before installing anything. Then run this in a shell (any
+terminal, including Windows PowerShell) and wait for it to finish:
 
 ```sh
 npx corkcli
 ```
+
+It comes from npm, and it checks the `cork` build it downloads against its
+published SHA-256 and Cork's Ed25519 release signature before running it. On a machine without Node,
+send the user to https://corkcli.com/install for the other ways to install;
+don't pipe a downloaded script into a shell on their behalf.
 
 It puts the `cork` program in `~/.cork/bin/cork`, adds that folder to the
 PATH in the shell's startup files, and installs Cork's hooks for Claude Code,
@@ -34,11 +34,11 @@ it up at their next prompt. In a shell opened before the install, run
 From inside Claude Code, the plugin does the same:
 
 ```
-/plugin marketplace add lithometric/cork
+/plugin marketplace add corkcli/cork
 /plugin install cork@cork
 ```
 
-For Codex, `codex plugin marketplace add lithometric/cork` and then
+For Codex, `codex plugin marketplace add corkcli/cork` and then
 `codex plugin add cork@cork` bring Cork's skills and MCP server. Codex's hooks
 come from the machine install above.
 

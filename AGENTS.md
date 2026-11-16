@@ -71,5 +71,5 @@ your agents and coordinate them like in any other repo. The skills in
 ## Questions and changes
 
 Open an issue or a pull request at
-[github.com/lithometric/cork](https://github.com/lithometric/cork). More
+[github.com/corkcli/cork](https://github.com/corkcli/cork). More
 about Cork: [corkcli.com](https://corkcli.com).
