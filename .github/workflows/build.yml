@@ -1,8 +1,24 @@
 name: build
 
+# Only what the jobs build and test starts them: a change to the plugin, the
+# skills or the docs alone runs nothing. Pushes run on main; a branch is
+# built once, by its pull request, not twice.
 on:
   push:
+    branches: [main]
+    paths:
+      - "hooks/**"
+      - "core/**"
+      - "free/**"
+      - "protocol/**"
+      - ".github/workflows/build.yml"
   pull_request:
+    paths:
+      - "hooks/**"
+      - "core/**"
+      - "free/**"
+      - "protocol/**"
+      - ".github/workflows/build.yml"
 
 jobs:
   build:
