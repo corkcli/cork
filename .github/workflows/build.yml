@@ -1,8 +1,24 @@
 name: build
 
+# Only what the jobs build and test starts them: a change to the plugin, the
+# skills or the docs alone runs nothing. Pushes run on main; a branch is
+# built once, by its pull request, not twice.
 on:
   push:
+    branches: [main]
+    paths:
+      - "hooks/**"
+      - "core/**"
+      - "free/**"
+      - "protocol/**"
+      - ".github/workflows/build.yml"
   pull_request:
+    paths:
+      - "hooks/**"
+      - "core/**"
+      - "free/**"
+      - "protocol/**"
+      - ".github/workflows/build.yml"
 
 jobs:
   build:
@@ -19,12 +35,23 @@ jobs:
           workspaces: |
             hooks
             free
+      # The suites are written for Linux and run there, as the source repo's
+      # own CI runs them; macOS and Windows build both programs, so a change
+      # that breaks either platform's build still fails here. (Windows' unit
+      # tests assume Unix paths and shells; macOS's timing tests are flaky
+      # on shared runners.)
       - name: Test the hooks
+        if: runner.os == 'Linux'
         working-directory: hooks
         run: cargo test --release
+      - name: Build the hooks
+        if: runner.os != 'Linux'
+        working-directory: hooks
+        run: cargo build --release
       - name: Build cork
         working-directory: free
         run: cargo build --release
       - name: Test the engine
+        if: runner.os == 'Linux'
         working-directory: free
         run: cargo test --release

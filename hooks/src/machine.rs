@@ -2489,6 +2489,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    // the move links ~/.collide to ~/.cork: a symlink, Unix only, as the
+    // functions it calls (old_machine, move_to_cork) are
+    #[cfg(unix)]
     #[test]
     fn an_old_machine_moves_to_cork_and_its_old_paths_keep_working() {
         let (home, env) = old_machine("old");
