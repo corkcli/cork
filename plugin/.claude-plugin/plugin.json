@@ -1,6 +1,6 @@
 {
   "name": "cork",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Several coding agents on one repo, without the collisions: each agent is briefed on the code its prompt is about, told the moment another agent or teammate changes what it depends on, and has its pushes rebased, tested and landed in one step.",
   "author": {
     "name": "Lithometric",
@@ -23,6 +23,5 @@
     "claude-code",
     "codex",
     "merge-conflicts"
-  ],
-  "hooks": "./hooks/hooks.json"
+  ]
 }

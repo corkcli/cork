@@ -18,7 +18,10 @@
 
 sub="$1"
 here="$(cd "$(dirname "$0")/.." && pwd)"
-root="${CLAUDE_PLUGIN_ROOT:-$here}"
+# Claude Code names this plugin's folder; run another way (a Codex skill, a
+# shell), it is the folder this launcher sits in, the same place
+[ -n "${CLAUDE_PLUGIN_ROOT}" ] || CLAUDE_PLUGIN_ROOT="$here"
+root="${CLAUDE_PLUGIN_ROOT}"
 proj="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 base="${CORK_HOME:-${COLLIDE_HOME:-$HOME}}"
 if [ ! -e "$base/.cork" ] && [ -e "$base/.collide" ]; then
@@ -64,17 +67,36 @@ case "$(uname -m)" in
 esac
 bin="$bin$ext"
 
-# the pinned file: its lock line ("<target> <sha>"), the download, the digest check
+# the pinned file: its lock line ("<target> <sha>"), the download, the digest
+# check. The download lands at one fixed name inside this plugin's own
+# folder, spelled out in the curl command (never a computed path, which the
+# plugin directory refuses: it could name curl's own config file), and only
+# a copy whose SHA-256 matches the lock moves on to $bin. A second session
+# starting at the same moment waits its turn and retries next session.
 fetch() {
-  want=$(awk -v t="$arch-$os" '$1==t {print $2}' "$lock" 2>/dev/null | head -1)
+  want=""
+  while read -r target sha; do
+    [ "$target" = "$arch-$os" ] && want="$sha"
+  done < "$lock"
   [ -n "$version" ] && [ -n "$os" ] && [ -n "$arch" ] && [ -n "$want" ] || return 1
   command -v curl >/dev/null 2>&1 || return 1
-  mkdir -p "$(dirname "$bin")" || return 1
-  tmp="$bin.download.$$"
-  curl -fsSL --max-time 120 "$server/artifacts/free/v/$version/$arch-$os" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-  got=$( (shasum -a 256 "$tmp" 2>/dev/null || sha256sum "$tmp" 2>/dev/null) | cut -d' ' -f1)
-  if [ -z "$got" ] || [ "$got" != "$want" ]; then rm -f "$tmp"; return 1; fi
-  chmod +x "$tmp" && mv "$tmp" "$bin"
+  mkdir -p "${CLAUDE_PLUGIN_ROOT}/.download" "$(dirname "$bin")" || return 1
+  if ! ( set -C; echo "$$" > "${CLAUDE_PLUGIN_ROOT}/.download/lock" ) 2>/dev/null; then
+    # a lock left by a session that is gone no longer holds
+    holder=$(cat "${CLAUDE_PLUGIN_ROOT}/.download/lock" 2>/dev/null)
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then return 1; fi
+    rm -f "${CLAUDE_PLUGIN_ROOT}/.download/lock"
+    ( set -C; echo "$$" > "${CLAUDE_PLUGIN_ROOT}/.download/lock" ) 2>/dev/null || return 1
+  fi
+  ok=1
+  if curl -fsSL --max-time 120 "$server/artifacts/free/v/$version/$arch-$os" -o "${CLAUDE_PLUGIN_ROOT}/.download/cork" 2>/dev/null; then
+    got=$( (shasum -a 256 "${CLAUDE_PLUGIN_ROOT}/.download/cork" 2>/dev/null || sha256sum "${CLAUDE_PLUGIN_ROOT}/.download/cork" 2>/dev/null) | cut -d' ' -f1)
+    if [ -n "$got" ] && [ "$got" = "$want" ] && chmod +x "${CLAUDE_PLUGIN_ROOT}/.download/cork" && mv -f "${CLAUDE_PLUGIN_ROOT}/.download/cork" "$bin"; then
+      ok=0
+    fi
+  fi
+  rm -f "${CLAUDE_PLUGIN_ROOT}/.download/cork" "${CLAUDE_PLUGIN_ROOT}/.download/lock"
+  return "$ok"
 }
 
 # the program that runs: the managed copy in ~/.cork/bin (an old install's
