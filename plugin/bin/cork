@@ -50,9 +50,8 @@ fi
 
 # the program: the one this plugin pinned (the free version's `cork`,
 # the hooks and the local server in one; published as `collide-<target>`),
-# kept per user, fetched once
+# fetched once into this plugin's own folder
 version=$(sed -n 's/^version //p' "$lock" 2>/dev/null | head -1)
-bin="$home/plugin-bin/v$version/$name"
 ext=""
 case "$(uname -s)" in
   Darwin) os=apple-darwin;;
@@ -65,13 +64,15 @@ case "$(uname -m)" in
   x86_64|amd64) arch=x86_64;;
   *) arch="";;
 esac
-bin="$bin$ext"
+pinned_copy="${CLAUDE_PLUGIN_ROOT}/.download/cork$ext"
 
-# the pinned file: its lock line ("<target> <sha>"), the download, the digest
-# check. The download lands at one fixed name inside this plugin's own
-# folder, spelled out in the curl command (never a computed path, which the
-# plugin directory refuses: it could name curl's own config file), and only
-# a copy whose SHA-256 matches the lock moves on to $bin. A second session
+# The pinned file: its lock line ("<target> <sha>"), the download, the
+# digest check. This launcher writes only inside its own folder, and every
+# file it writes is named in full in the command that writes it (the plugin
+# directory refuses a computed path where curl runs: it could be curl's own
+# config file). The copy lands as `incoming`, and only one whose SHA-256
+# matches the lock becomes the pinned copy. Putting it in ~/.cork is the
+# program's own job (`cork install`), not this script's. A second session
 # starting at the same moment waits its turn and retries next session.
 fetch() {
   want=""
@@ -80,7 +81,7 @@ fetch() {
   done < "$lock"
   [ -n "$version" ] && [ -n "$os" ] && [ -n "$arch" ] && [ -n "$want" ] || return 1
   command -v curl >/dev/null 2>&1 || return 1
-  mkdir -p "${CLAUDE_PLUGIN_ROOT}/.download" "$(dirname "$bin")" || return 1
+  mkdir -p "${CLAUDE_PLUGIN_ROOT}/.download" || return 1
   if ! ( set -C; echo "$$" > "${CLAUDE_PLUGIN_ROOT}/.download/lock" ) 2>/dev/null; then
     # a lock left by a session that is gone no longer holds
     holder=$(cat "${CLAUDE_PLUGIN_ROOT}/.download/lock" 2>/dev/null)
@@ -89,13 +90,17 @@ fetch() {
     ( set -C; echo "$$" > "${CLAUDE_PLUGIN_ROOT}/.download/lock" ) 2>/dev/null || return 1
   fi
   ok=1
-  if curl -fsSL --max-time 120 "$server/artifacts/free/v/$version/$arch-$os" -o "${CLAUDE_PLUGIN_ROOT}/.download/cork" 2>/dev/null; then
-    got=$( (shasum -a 256 "${CLAUDE_PLUGIN_ROOT}/.download/cork" 2>/dev/null || sha256sum "${CLAUDE_PLUGIN_ROOT}/.download/cork" 2>/dev/null) | cut -d' ' -f1)
-    if [ -n "$got" ] && [ "$got" = "$want" ] && chmod +x "${CLAUDE_PLUGIN_ROOT}/.download/cork" && mv -f "${CLAUDE_PLUGIN_ROOT}/.download/cork" "$bin"; then
-      ok=0
+  if curl -fsSL --max-time 120 "$server/artifacts/free/v/$version/$arch-$os" -o "${CLAUDE_PLUGIN_ROOT}/.download/incoming" 2>/dev/null; then
+    got=$( (shasum -a 256 "${CLAUDE_PLUGIN_ROOT}/.download/incoming" 2>/dev/null || sha256sum "${CLAUDE_PLUGIN_ROOT}/.download/incoming" 2>/dev/null) | cut -d' ' -f1)
+    if [ -n "$got" ] && [ "$got" = "$want" ] && chmod +x "${CLAUDE_PLUGIN_ROOT}/.download/incoming"; then
+      if [ -n "$ext" ]; then
+        mv -f "${CLAUDE_PLUGIN_ROOT}/.download/incoming" "${CLAUDE_PLUGIN_ROOT}/.download/cork.exe" && ok=0
+      else
+        mv -f "${CLAUDE_PLUGIN_ROOT}/.download/incoming" "${CLAUDE_PLUGIN_ROOT}/.download/cork" && ok=0
+      fi
     fi
   fi
-  rm -f "${CLAUDE_PLUGIN_ROOT}/.download/cork" "${CLAUDE_PLUGIN_ROOT}/.download/lock"
+  rm -f "${CLAUDE_PLUGIN_ROOT}/.download/incoming" "${CLAUDE_PLUGIN_ROOT}/.download/lock"
   return "$ok"
 }
 
@@ -105,24 +110,24 @@ fetch() {
 managed="$home/bin/$name$ext"
 vnum() { "$1" --version 2>/dev/null | sed -n 's/.*hook artifacts v\([0-9][0-9]*\).*/\1/p' | head -1; }
 
-# the pinned build, downloaded once if it is not here yet
+# the pinned build of this plugin's version, fetched once
 pinned() {
-  [ -x "$bin" ] && return 0
+  [ -x "$pinned_copy" ] && [ "$(vnum "$pinned_copy")" = "$version" ] && return 0
   fetch
 }
 
-# put the pinned build where it keeps itself current
+# the pinned build puts itself where it keeps itself current (and sets the
+# machine up, as the first session does anyway)
 place() {
-  mkdir -p "$(dirname "$managed")" || return 1
-  cp "$bin" "$managed.new.$$" && chmod +x "$managed.new.$$" && mv -f "$managed.new.$$" "$managed"
+  "$pinned_copy" install --no-settings >/dev/null 2>&1 && [ -x "$managed" ]
 }
 
 run="$managed"
 if [ ! -x "$managed" ]; then
   if pinned && place; then
     run="$managed"
-  elif [ -x "$bin" ]; then
-    run="$bin"
+  elif [ -x "$pinned_copy" ]; then
+    run="$pinned_copy"
   else
     if is_event; then
       [ "$sub" = "session-start" ] && echo "Cork plugin: Cork could not be downloaded for this machine ($arch-$os), so it is off in this session. Tell the user; it retries next session."
@@ -135,7 +140,7 @@ elif [ "$sub" = "session-start" ] && [ -n "$version" ]; then
   # once a session: never older than this plugin's pin
   have=$(vnum "$managed")
   if [ "${have:-0}" -lt "$version" ] 2>/dev/null && pinned; then
-    place || run="$bin"
+    place || run="$pinned_copy"
   fi
 fi
 
