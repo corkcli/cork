@@ -1,0 +1,27 @@
+{
+  "name": "cork",
+  "version": "0.4.4",
+  "description": "Several coding agents on one repo, without the collisions: each agent is briefed on the code its prompt is about, told the moment another agent or teammate changes what it depends on, and has its pushes rebased, tested and landed in one step.",
+  "author": {
+    "name": "Lithometric",
+    "url": "https://corkcli.com"
+  },
+  "homepage": "https://corkcli.com",
+  "documentationUrl": "https://corkcli.com/docs/claude-code",
+  "supportUrl": "https://corkcli.com/support",
+  "privacyPolicyUrl": "https://corkcli.com/privacy",
+  "termsOfServiceUrl": "https://corkcli.com/terms",
+  "icon": "./assets/icon.png",
+  "repository": "https://github.com/corkcli/cork/tree/main/listing",
+  "license": "MIT",
+  "keywords": [
+    "multi-agent",
+    "coordination",
+    "coding-agents",
+    "hooks",
+    "mcp",
+    "claude-code",
+    "codex",
+    "merge-conflicts"
+  ]
+}
