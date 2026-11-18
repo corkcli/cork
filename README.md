@@ -120,7 +120,8 @@ npx skills add corkcli/cork
 ## Documentation
 
 - Setup by tool: [Claude Code](https://corkcli.com/docs/claude-code) · [Codex](https://corkcli.com/docs/codex) · [Cursor](https://corkcli.com/docs/cursor) · [Gemini CLI](https://corkcli.com/docs/gemini-cli)
-- Reference: [the `cork` command](https://corkcli.com/docs/cli) · [MCP tools](https://corkcli.com/docs/mcp-tools) · [all docs](https://corkcli.com/docs)
+- Reference: [Cork CLI (the `cork` command)](https://corkcli.com/docs/cli) · [Cork MCP server and tools](https://corkcli.com/docs/mcp-tools) · [Cork API docs (REST v1)](https://corkcli.com/docs/api) · [all docs](https://corkcli.com/docs)
+- Try it with no account: [the sandbox](https://corkcli.com/docs/sandbox) · Cork's docs over MCP, no sign-in: `https://corkcli.com/docs/mcp`
 - Guides: [Do you need git worktrees for AI coding agents?](https://corkcli.com/guides/do-you-need-git-worktrees-for-ai-coding-agents) · [Cleaning up the worktrees agents leave behind](https://corkcli.com/guides/clean-up-git-worktrees-ai-coding-agents)
 - [Changelog](https://corkcli.com/changelog) · [Benchmarks](https://corkcli.com/benchmarks) · For agents: [llms.txt](https://corkcli.com/llms.txt), [agents.md](https://corkcli.com/agents.md)
 
